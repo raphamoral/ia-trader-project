@@ -303,3 +303,17 @@ def test_population_with_styles_uses_loader_for_1m():
         assert "1m" in calls
     assert any(k.startswith("style_born:") for k in pop.totals)
     assert sum(v for k, v in pop.totals.items() if k.startswith("regime_bars:")) > 0
+
+
+def test_signal_check_candidates_and_price_only_strip():
+    from trader.daytrade.signal_check import Example, candidates, strip_context
+
+    g = DayGenome("momentum", {"lookback": 5, "threshold_bps": 30}, regime_map={r: "momentum" for r in REGIMES},
+                  news_gate=0.5, black_weight=0.4)
+    assert strip_context(g).regime_map is None and strip_context(g).black_weight == 0
+    ex = Example(g, g, {"cause": "drawdown", "life": {"pnl_by_regime": {"extreme": -1.0}}, "last_window": {}},
+                 [(T0, T0 + pd.Timedelta(days=15))], "k")
+    c = candidates(ex, price_only=True)
+    assert set(c) == {"successor", "rules", "parent", "baseline", "mutation0", "mutation1"}
+    assert all(v.regime_map is None and v.news_gate is None for v in c.values())
+    assert candidates(ex, price_only=True)["rules"] == c["rules"]  # determinístico por chave

@@ -162,6 +162,17 @@ class LLMVerifier:
         return out
 
 
+def trusted_covered(times: pd.Series, trusted_times: pd.Series, span: pd.Timedelta = pd.Timedelta(hours=24)) -> np.ndarray:
+    """A coleta confiável estava rodando em volta do instante? (≥1 item confiável nas 24 h antes E nas 24 h depois.)
+    Sem isso não dá para dizer quem chegou primeiro: a base confiável tem buracos (ex.: GDELT só em alguns meses)."""
+    tt = np.sort(utc64(trusted_times))
+    v = utc64(times)
+    w = np.timedelta64(int(span.total_seconds()), "s")
+    before = np.searchsorted(tt, v, "left") - np.searchsorted(tt, v - w, "left")
+    after = np.searchsorted(tt, v + w, "right") - np.searchsorted(tt, v, "left")
+    return (before > 0) & (after > 0)
+
+
 def item_lags(
     black: pd.DataFrame, matches: pd.DataFrame, data_end: pd.Timestamp, horizon: pd.Timedelta = pd.Timedelta(hours=48)
 ) -> pd.DataFrame:
@@ -226,7 +237,7 @@ def source_table(lags: pd.DataFrame, reputation: pd.DataFrame | None = None, edg
     """Por fonte: leads, ecos, sem confirmação, lag mediano, % primeiro, sinal de eco, janela de preço."""
     rows = []
     for source, g in lags.groupby("source"):
-        resolved = g[g["status"] != "pending"]
+        resolved = g[~g["status"].isin(["pending", "no_coverage"])]
         conf = resolved[resolved["status"].isin(["lead", "echo"])]
         leads = (resolved["status"] == "lead").sum()
         echoes = (resolved["status"] == "echo").sum()

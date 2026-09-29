@@ -174,7 +174,8 @@ def scenario():
         item(2, 600, "Exchange Kraken hacked hot wallet drained millions report", source="echoer", claim=True),
         item(3, 10, "Tether collapse imminent insiders confirm", source="liar", claim=True),
     ])
-    tr = trusted([("t1", "reuters.com", 1, T0 + pd.Timedelta(minutes=120), "Kraken hot wallet hacked, millions drained", "BTC")])
+    tr = trusted([("t0", "reuters.com", 1, T0 - pd.Timedelta(hours=1), "Markets open mixed", "BTC"),
+                  ("t1", "reuters.com", 1, T0 + pd.Timedelta(minutes=120), "Kraken hot wallet hacked, millions drained", "BTC")])
     return black, tr
 
 

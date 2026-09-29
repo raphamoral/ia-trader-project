@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from trader.blacknews import leadlag, spam
@@ -47,6 +48,9 @@ def analyze_frames(items: pd.DataFrame, trusted: pd.DataFrame, verify=None) -> A
     ends = [scored["visible_at"].max()] + ([trusted["visible_at"].max()] if len(trusted) else [])
     data_end = max(ends)
     lags = leadlag.item_lags(scored, matches, data_end, HORIZON)
+    # fora da cobertura confiável não dá para julgar quem chegou primeiro
+    covered = leadlag.trusted_covered(lags["visible_at"], trusted["visible_at"]) if len(trusted) else np.zeros(len(lags), bool)
+    lags.loc[~covered & (lags["status"] != "echo"), "status"] = "no_coverage"
     outs = black_outcomes(lags, scored)
     rep = black_reputation(outs, scored)
     return Analysis(scored, trusted, matches, lags, outs, rep, data_end)
@@ -91,7 +95,9 @@ def analyze_security_frames(items: pd.DataFrame, trusted: pd.DataFrame) -> Secur
     conf = security.confirmations(deduped, trusted)
     ends = [deduped["visible_at"].max()] + ([trusted["visible_at"].max()] if len(trusted) else [])
     data_end = max(ends)
-    lags = security.incident_lags(deduped, conf, data_end, HORIZON)
+    inc_times = deduped.dropna(subset=["incident_id"])["visible_at"]
+    covered = leadlag.trusted_covered(inc_times, trusted["visible_at"]) if len(trusted) else np.zeros(len(inc_times), bool)
+    lags = security.incident_lags(deduped, conf, data_end, HORIZON, covered=covered)
     outs = black_outcomes(lags)
     rep = black_reputation(outs, deduped, tier=security.REPUTATION_TIER)
     return SecurityAnalysis(deduped, conf, lags, outs, rep, data_end)

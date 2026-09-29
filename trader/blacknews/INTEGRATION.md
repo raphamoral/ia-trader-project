@@ -199,3 +199,10 @@ parte "antes da imprensa" depende das páginas de status das exchanges e da cole
   para "houve um hack grande ontem?", mas não para medir quem noticiou primeiro.
 
 CLI: `python -m trader.blacknews sec-backfill`, `sec-extract --max-calls N`, `sec-leadlag`.
+- **Cobertura confiável:** lead/eco só é julgado quando a coleta confiável estava rodando em volta do instante, com
+  ≥1 item confiável nas 24 h antes **e** nas 24 h depois (`leadlag.trusted_covered`). Fora disso o status é
+  `no_coverage`, sem crédito e sem falha. Hoje a base confiável tem só jan/2024 (GDELT) e 25–29/09/2026, então
+  **nenhum incidente pôde ser julgado** (1.312 `no_coverage`). O "lead" de 37 h do DeFiLlama sobre o hack da
+  Bitget era artefato dessa falta de cobertura.
+- As features contam só hack, exploit, alegação de vazamento, rug pull e parada de saque. Paradas rotineiras das
+  páginas de status ("depósitos atrasados") ficam guardadas, mas não entram.

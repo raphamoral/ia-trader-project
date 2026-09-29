@@ -339,6 +339,8 @@ def _validate(raw: dict) -> dict[str, Any]:
     except (TypeError, ValueError):
         amount = None
     entity = raw.get("entity")
+    if isinstance(entity, str) and entity.strip().lower() in {"n/a", "na", "none", "null", "unknown", "-"}:
+        entity = None
     return {
         "entity": entity.strip()[:60] if isinstance(entity, str) and entity.strip() else None,
         "entity_type": raw.get("entity_type") if raw.get("entity_type") in ENTITY_TYPES else "other",
@@ -493,20 +495,29 @@ def confirmations(items: pd.DataFrame, trusted: pd.DataFrame, window: pd.Timedel
     return out
 
 
-def incident_lags(items: pd.DataFrame, conf: pd.DataFrame, data_end: pd.Timestamp, horizon: pd.Timedelta = pd.Timedelta(hours=48)) -> pd.DataFrame:
-    """Mesmo formato de leadlag.item_lags, para reaproveitar reputação e tabela por fonte."""
+def incident_lags(
+    items: pd.DataFrame, conf: pd.DataFrame, data_end: pd.Timestamp, horizon: pd.Timedelta = pd.Timedelta(hours=48),
+    covered: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Mesmo formato de leadlag.item_lags, para reaproveitar reputação e tabela por fonte.
+
+    covered: máscara (na ordem dos itens de incidente) de leadlag.trusted_covered. Fora da cobertura
+    não dá para saber quem chegou primeiro: status "no_coverage", sem crédito nem falha."""
     inc = items.dropna(subset=["incident_id"]).merge(conf, on="id", how="left")
     ref = inc["first_trusted_at"]
     lag = (inc["visible_at"] - ref).dt.total_seconds() / 60
     in_horizon = ref.notna() & (ref <= inc["visible_at"] + horizon)
     status = np.where(~in_horizon, "unconfirmed", np.where(lag < 0, "lead", "echo"))
     pending = ~in_horizon & (inc["visible_at"] + horizon > data_end)
+    status = np.where(pending, "pending", status)
+    if covered is not None:
+        status = np.where(covered | (status == "echo"), status, "no_coverage")  # eco já é fato: a confiável veio antes
     return pd.DataFrame({
         "id": inc["id"], "source": inc["source"], "source_kind": inc["source_kind"], "visible_at": inc["visible_at"],
         "assets": inc["assets"], "stance": "bearish", "is_claim": True,
         "first_trusted_at": ref.where(in_horizon), "first_tier1_at": inc["first_tier1_at"].where(in_horizon),
         "story_id": inc["incident_id"], "lag_min": lag.where(in_horizon),
-        "status": np.where(pending, "pending", status),
+        "status": status,
     })
 
 
@@ -517,6 +528,8 @@ SEC_FEATURES = ["black_sec_incident_count", "black_sec_max_claimed_usd", "black_
                 "black_sec_confirmed_flag"]
 SEC_RW_FEATURES = ["black_rw_sec_incident_score"]
 NO_INCIDENT_MINUTES = 7 * 24 * 60.0
+# paradas rotineiras ("depósitos atrasados") ficam guardadas, mas não contam como incidente nas features
+FEATURE_TYPES = ("hack", "exploit", "breach_claim", "rug_pull", "withdrawal_halt")
 
 
 B3_ENTITIES = {"petrobras": "PETR4", "vale": "VALE3", "itau": "ITUB4", "itaú": "ITUB4", "bradesco": "BBDC4",
@@ -537,7 +550,7 @@ def security_features(
 ) -> pd.DataFrame:
     """black_sec_* por instante: só incidentes com visible_at <= t; confirmação só se já visível em t."""
     inc = items.dropna(subset=["incident_id"]).copy()
-    inc = inc[inc["entity"].map(asset_of) == asset]
+    inc = inc[inc["incident_type"].isin(FEATURE_TYPES) & (inc["entity"].map(asset_of) == asset)]
     if conf is not None and len(conf):
         inc = inc.merge(conf[["id", "confirmed_at"]], on="id", how="left")
     else:

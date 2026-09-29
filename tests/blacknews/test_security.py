@@ -171,7 +171,9 @@ def world():
         sec_item(4, 60 * 50, "Petrobras", source="certik", itype="breach_claim"),
     ])
     tr = trusted([
+        ("t0", "reuters.com", 1, T0 - pd.Timedelta(hours=1), "Markets open mixed", "BTC"),  # coleta já rodando
         ("t1", "coindesk.com", 1, T0 + pd.Timedelta(minutes=120), "Bitget hacked, $387M stolen", "BTC"),
+        ("t1b", "reuters.com", 1, T0 + pd.Timedelta(hours=40), "Fed speakers ahead", "BTC"),
         ("t2", "valor.com.br", 1, T0 + pd.Timedelta(hours=60), "Petrobras investiga vazamento de dados", "PETR4"),
     ])
     return items, tr
@@ -216,3 +218,12 @@ def test_security_features_causal_under_truncation():
             part_sec = analyze_security_frames(items[items["visible_at"] <= cutoff], tr[tr["visible_at"] <= cutoff])
             part = black_features_from(None, "BTC", "5m", idx, weighted=w, sec=part_sec)
             pd.testing.assert_frame_equal(full[idx <= cutoff], part[idx <= cutoff])
+
+
+def test_no_lead_credit_before_trusted_coverage():
+    items, tr = world()
+    early = security.make_frame([sec_item(9, -60 * 24 * 3, "Bitget", source="defillama.com", kind="incident_db")])
+    sec = analyze_security_frames(pd.concat([items, early], ignore_index=True), tr)
+    lags = sec.lags.set_index("id")
+    assert lags.loc["defillama.com:9", "status"] == "no_coverage"
+    assert "defillama.com" not in set(sec.outcomes["source"])
