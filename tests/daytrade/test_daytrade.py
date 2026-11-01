@@ -182,6 +182,11 @@ def test_every_strategy_is_causal_and_fires(strategy):
     df["high"] = body_hi * (1 + np.abs(rng.normal(0, 0.004, len(df))))  # pavios aleatórios
     df["low"] = body_lo * (1 - np.abs(rng.normal(0, 0.004, len(df))))
     df["volume"] = rng.lognormal(0, 0.8, len(df))
+    if strategy in ("xs_momentum", "funding_reversal"):  # estratégias de mercado leem as colunas mkt_
+        for lb in (12, 48, 288):
+            df[f"mkt_xs_rank_{lb}"] = np.clip(0.5 + 0.5 * np.sin(np.arange(len(df)) / (7 + lb / 12)), 0, 1)
+        df["mkt_funding_bps"] = np.repeat(rng.normal(0, 4, len(df) // 96 + 1), 96)[: len(df)]
+        df["mkt_oi_z"] = rng.normal(0, 1.5, len(df))
     lo_hi = DAY_STRATEGIES[strategy]
     g = DayGenome(strategy, {k: lo + (hi - lo) // 8 for k, (lo, hi) in lo_hi.items()}, news_follow=0.3).normalized()
     idx = pd.DatetimeIndex(df["ts"] + TF)
@@ -431,3 +436,14 @@ def test_ladder_population_runs():
         pop.step(T0 + pd.Timedelta(days=d), T0 + pd.Timedelta(days=d + 4))
     assert sum(pop.rung_census().values()) == len(pop.alive)
     assert all(a.r_history is not None for a in pop.alive)
+
+
+def test_day_creator_prompt_includes_playbook_and_passages():
+    from trader.daytrade.creator import DayLLMCreator
+
+    c = DayLLMCreator("SOL/USDT", "5m", {"capital": "R$100", "max_lev": "3", "max_risk": "0.02", "daily_loss": "0.05",
+                                          "min_order": "5", "goal": "consistency"},
+                      lessons=lambda: ["Use RSI 14 with 30/70 [Livro p.1]"],
+                      library=lambda q: [{"book": "Livro", "page": 7, "text": "cut losses early"}])
+    p = c.prompt({"cause": "fees", "life": {}, "last_window": {}})
+    assert "Playbook from trading books" in p and "RSI 14" in p and "[Livro p.7]" in p

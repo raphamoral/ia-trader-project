@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Trader — Conversa</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+          --accent: #2f5bd3; --me: #e9efff; --bot: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --card: #171b21; --text: #e6e9ee; --muted: #98a2b3; --line: #2a303a;
+            --accent: #7aa2ff; --me: #1d2740; --bot: #171b21; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  header a { color: var(--accent); font-size: 14px; }
+  #log { flex: 1; overflow-y: auto; margin: 12px 0; display: flex; flex-direction: column; gap: 10px; }
+  .msg { border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; white-space: pre-wrap; max-width: 92%; }
+  .me { background: var(--me); align-self: flex-end; }
+  .bot { background: var(--bot); align-self: flex-start; }
+  .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  form { display: flex; flex-direction: column; gap: 8px; }
+  textarea { font: inherit; padding: 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--card);
+             color: var(--text); resize: vertical; min-height: 70px; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 14px; color: var(--muted); }
+  button { font: inherit; padding: 8px 18px; border-radius: 8px; border: 0; cursor: pointer; background: var(--accent); color: #fff; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Conversa com a LLM do sistema (Qwen local)</h1>
+    <a href="http://127.0.0.1:8765" target="_blank">painel →</a>
+  </header>
+  <div id="log"></div>
+  <form id="form">
+    <textarea id="input" placeholder="Pergunte algo… (Enter envia, Shift+Enter quebra linha)"></textarea>
+    <div class="row">
+      <label><input type="checkbox" id="books"> consultar os livros (cita livro e página)</label>
+      <span><button type="button" class="ghost" id="clear">Limpar conversa</button> <button id="send">Enviar</button></span>
+    </div>
+  </form>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let history = [];
+try { history = JSON.parse(localStorage.getItem("chat") || "[]"); } catch (e) { history = []; }
+const save = () => { try { localStorage.setItem("chat", JSON.stringify(history.slice(-40))); } catch (e) {} };
+
+function bubble(role, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + (role === "user" ? "me" : "bot");
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = role === "user" ? "você" : "Qwen";
+  const body = document.createElement("div");
+  body.textContent = text;
+  div.append(who, body);
+  $("log").append(div);
+  $("log").scrollTop = $("log").scrollHeight;
+  return body;
+}
+history.forEach((m) => bubble(m.role, m.content));
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text) return;
+  $("input").value = "";
+  history.push({role: "user", content: text});
+  bubble("user", text);
+  const out = bubble("assistant", "…");
+  $("send").disabled = true;
+  let answer = "";
+  try {
+    const resp = await fetch("/api/chat", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({messages: history, books: $("books").checked})});
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      answer += dec.decode(value, {stream: true});
+      out.textContent = answer;
+      $("log").scrollTop = $("log").scrollHeight;
+    }
+  } catch (e) { answer += "\n[sem resposta do painel]"; out.textContent = answer; }
+  history.push({role: "assistant", content: answer});
+  save();
+  $("send").disabled = false;
+  $("input").focus();
+}
+
+$("form").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+$("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("clear").addEventListener("click", () => { history = []; save(); $("log").innerHTML = ""; });
+</script>
+</body>
+</html>

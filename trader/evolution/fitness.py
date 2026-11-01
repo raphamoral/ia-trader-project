@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from trader.backtest import run_backtest
+from trader.execution.paper import BINANCE_SPOT_FEE
 from trader.evolution.genome import Genome, GenomeEngine
 
 
@@ -31,6 +32,9 @@ class WindowStats:
     dd_high_vol: bool = False  # amplitude do mercado acima do normal durante a queda
     dd_market_down: bool = False  # o próprio ativo caiu forte durante a queda
     median_range: float = 0.0  # amplitude média típica da janela (fração do preço)
+    # contexto de mercado da janela, usado na análise de sucesso
+    market_ret: float = 0.0  # quanto o próprio ativo variou na janela
+    news_sentiment: float | None = None  # sentimento médio das notícias (None sem dados de notícia)
 
     @property
     def score(self) -> float:
@@ -38,9 +42,10 @@ class WindowStats:
 
 
 def evaluate(
-    genome: Genome, candles: pd.DataFrame, symbol: str, timeframe: str, start: pd.Timestamp, end: pd.Timestamp
+    genome: Genome, candles: pd.DataFrame, symbol: str, timeframe: str, start: pd.Timestamp, end: pd.Timestamp,
+    fee_rate: float = BINANCE_SPOT_FEE,
 ) -> WindowStats:
-    result = run_backtest(GenomeEngine(genome), candles, symbol, timeframe, start, end)
+    result = run_backtest(GenomeEngine(genome), candles, symbol, timeframe, start, end, fee_rate=fee_rate)
     window = candles[(candles["ts"] >= start) & (candles["ts"] < end)].reset_index(drop=True)
     stats = dict(
         start=start,
@@ -50,7 +55,31 @@ def evaluate(
         trades=result.n_trades,
     )
     stats.update(_drawdown_context(result.equity.to_numpy(), window))
+    if len(window):
+        stats["market_ret"] = float(window["close"].iloc[-1] / window["open"].iloc[0] - 1)
+        if "news_sentiment" in window.columns:
+            stats["news_sentiment"] = float(window["news_sentiment"].fillna(0).mean())
     return WindowStats(**stats)
+
+
+def combine(stats: list[WindowStats]) -> WindowStats:
+    """Uma janela operada em vários ativos com o mesmo genoma: carteira de pesos iguais."""
+    if len(stats) == 1:
+        return stats[0]
+    mean = lambda xs: sum(xs) / len(xs)
+    news = [s.news_sentiment for s in stats if s.news_sentiment is not None]
+    return WindowStats(
+        start=stats[0].start,
+        ret=mean([s.ret for s in stats]),
+        gross_ret=mean([s.gross_ret for s in stats]),
+        max_dd=mean([s.max_dd for s in stats]),  # aproximação da queda da carteira
+        trades=sum(s.trades for s in stats),
+        dd_high_vol=sum(s.dd_high_vol for s in stats) * 2 > len(stats),
+        dd_market_down=sum(s.dd_market_down for s in stats) * 2 > len(stats),
+        median_range=mean([s.median_range for s in stats]),
+        market_ret=mean([s.market_ret for s in stats]),
+        news_sentiment=mean(news) if news else None,
+    )
 
 
 def _drawdown_context(curve: np.ndarray, window: pd.DataFrame) -> dict:

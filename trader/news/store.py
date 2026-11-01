@@ -22,7 +22,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from trader.news.sources import tier_of
+from trader.news.sources import UNLISTED_TIER, tier_of
+from trader.storage.atomic import replace_with_retry, unique_tmp
 
 DEFAULT_LATENCY = pd.Timedelta(minutes=5)
 # capturado muito depois da publicação = registro histórico, não observação ao vivo.
@@ -47,14 +48,19 @@ def item_id(url: str, title: str) -> str:
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
-def make_frame(rows: list[dict]) -> pd.DataFrame:
-    """Normaliza itens brutos: id, nível da fonte, relógios UTC; descarta fontes fora da lista."""
+def make_frame(rows: list[dict], keep_unlisted: bool = False) -> pd.DataFrame:
+    """Normaliza itens brutos: id, nível da fonte, relógios UTC.
+
+    Fontes fora da lista são descartadas, ou mantidas com tier=UNLISTED_TIER se keep_unlisted.
+    """
     base = [c for c in COLUMNS if c not in ("id", "tier")]
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=COLUMNS)
     extras = [c for c in df.columns if c not in base]  # ex.: colunas gkg_* do GDELT
     df["tier"] = df["domain"].map(tier_of)
+    if keep_unlisted:
+        df["tier"] = df["tier"].fillna(UNLISTED_TIER)
     df = df[df["tier"].notna()].copy()
     df["tier"] = df["tier"].astype(int)
     df["id"] = [item_id(u, t) for u, t in zip(df["url"], df["original_text"])]
@@ -97,9 +103,9 @@ class NewsStore:
             part = part.sort_values("first_seen_at").drop_duplicates("id", keep="first")
             part["query_assets"] = part["id"].map(assets)
             part = part.sort_values("published_at").reset_index(drop=True)
-            tmp = path.with_suffix(".tmp")
+            tmp = unique_tmp(path)
             part.to_parquet(tmp, index=False)
-            os.replace(tmp, path)
+            replace_with_retry(tmp, path)
             added += len(part) - before
         return added
 
@@ -112,11 +118,21 @@ class NewsStore:
             changed = int((new != df["backfilled"]).sum())
             if changed:
                 df["backfilled"] = new
-                tmp = path.with_suffix(".tmp")
+                tmp = unique_tmp(path)
                 df.to_parquet(tmp, index=False)
-                os.replace(tmp, path)
+                replace_with_retry(tmp, path)
                 fixed += changed
         return fixed
+
+    def read_range(self, since: pd.Timestamp | None = None, until: pd.Timestamp | None = None) -> pd.DataFrame:
+        """Só as partições mensais que podem conter o período (o GDELT tem milhões de linhas)."""
+        lo = None if since is None else pd.Timestamp(since).strftime("%Y-%m")
+        hi = None if until is None else pd.Timestamp(until).strftime("%Y-%m")
+        files = [f for f in sorted(self.root.glob("*.parquet"))
+                 if (lo is None or f.stem >= lo) and (hi is None or f.stem <= hi)]
+        if not files:
+            return pd.DataFrame(columns=COLUMNS)
+        return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
     def read_all(self) -> pd.DataFrame:
         files = sorted(self.root.glob("*.parquet"))

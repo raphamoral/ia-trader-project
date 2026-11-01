@@ -8,7 +8,7 @@ from trader.daytrade.backtest import run_daytrade_backtest
 from trader.daytrade.broker import BINANCE_USDM_MAKER, BINANCE_USDM_TAKER
 from trader.daytrade.features import asof_items, attach_features, news_view, stub_black, stub_white
 from trader.daytrade.gate import DayTradeLimits
-from trader.daytrade.genome import STYLES, DayGenome, eligible, mutate_day, random_day_genome, switch_style
+from trader.daytrade.genome import STOP_ENTRY_STRATEGIES, STYLES, DayGenome, eligible, mutate_day, random_day_genome, switch_style
 from trader.daytrade.regime import REGIMES, regime_features
 
 T0 = pd.Timestamp("2024-01-01", tz="UTC")
@@ -240,7 +240,9 @@ def test_style_switch_keeps_strategy_eligible():
         assert g2.style == s and g2.strategy in eligible(s)
         assert DayGenome.from_dict(g2.to_dict()) == g2
     assert STYLES["scalping"]["timeframe"] == "1m"
-    assert random_day_genome(rng, style="scalping").order_type == "limit"
+    scalp = next(g for g in (random_day_genome(rng, style="scalping") for _ in range(50))
+                 if g.strategy not in STOP_ENTRY_STRATEGIES)
+    assert scalp.order_type == "limit"
     assert random_day_genome(rng, strategy="vol_expansion", style="expansion").order_type == "stop"
 
 

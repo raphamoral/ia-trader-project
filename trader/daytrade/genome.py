@@ -10,6 +10,16 @@ Autonomia diária (genes; o Criador pode mudar todos):
   daily_target        meta do dia; atingida, para até a próxima sessão
   risk                fração do patrimônio arriscada até o stop, por operação
 
+Saída (genes; ajustados no fechamento de cada candle, o stop nunca recua):
+  trail               trailing stop desde a entrada, fração do preço
+  lock_at, lock_keep  trava de lucro em degraus: depois que o ganho máximo
+                      passa de lock_at R (R = distância do stop inicial), o stop
+                      sobe para garantir lock_keep desse ganho, nunca abaixo do
+                      zero a zero com taxas
+  runner_vol          com a posição no lucro e a volatilidade (percentil do ATR)
+                      acima disso, cancela o alvo e deixa o ganho correr...
+  runner_atr          ...com o stop a runner_atr × ATR do fechamento
+
 Escalada de risco (genes; sempre limitada pelos tetos congelados do gate):
   after_win_mult      multiplica o tamanho após uma operação vencedora no dia
                       (>1 = anti-martingale)
@@ -52,7 +62,12 @@ DAY_STRATEGIES: dict[str, dict[str, tuple[int, int]]] = {
     "trend_pullback": {"fast": (5, 30), "slow": (30, 200)},
     "news_event": {"min_abs_sent10": (2, 9)},
     "grid": {"step_bps": (10, 200), "levels": (1, 5)},
+    # sinais de mercado (exigem as features mkt_: ver market_signals.py)
+    "xs_momentum": {"lookback": (0, 2), "top_pct": (10, 45)},
+    "funding_reversal": {"funding_bps": (1, 30), "oi_z10": (0, 30)},
 }
+MARKET_STRATEGIES = {"xs_momentum", "funding_reversal"}
+XS_LOOKBACK_CHOICES = (12, 48, 288)  # índice do gene `lookback` do xs_momentum
 CATALOG: dict[str, str] = {
     "momentum": "enter in the direction of the N-bar return when it crosses ±threshold_bps; exit when it flips sign",
     "orb": "opening range breakout: high/low of the first range_bars candles of the session, enter on breakout",
@@ -74,31 +89,37 @@ CATALOG: dict[str, str] = {
     "trend_pullback": "trend by EMA(fast) vs EMA(slow); enter when price pulls back to EMA(fast) and closes back in the trend direction",
     "news_event": "trade in the direction of fresh high-confidence news (|sentiment| >= min_abs_sent10/10 and confidence >= news_follow)",
     "grid": "bounded grid around the session VWAP: LIMIT entries every step_bps, at most `levels` add-ons, exit at VWAP; ruin still kills",
+    "xs_momentum": "cross-sectional momentum in a 10-coin basket: rank of this coin's return over 1h/4h/1d (lookback 0/1/2); "
+                   "long when it enters the top top_pct%, short when it enters the bottom top_pct%, exit back at the middle",
+    "funding_reversal": "fade crowded leverage: short when the settled funding rate >= funding_bps (longs paying) and the "
+                        "open-interest 1h shock z >= oi_z10/10; long on the mirror (funding <= -funding_bps). oi_z10=0 ignores OI",
 }
 
 # estilo → timeframe, estratégias elegíveis, tipo de ordem de entrada
 STYLES: dict[str, dict] = {
     "scalping": {"timeframe": "1m", "order": "limit", "max_hold": (2, 30),
                  "strategies": ["momentum", "bb_revert", "vwap_revert", "orb", "inside_bar", "vol_expansion"]},
-    "momentum": {"timeframe": "15m", "order": "market", "max_hold": (0, 96),
+    "momentum": {"timeframe": "5m", "order": "market", "max_hold": (0, 96),
                  "strategies": ["momentum", "donchian", "bb_breakout", "orb", "macd", "ema_cross"]},
-    "mean_reversion": {"timeframe": "15m", "order": "limit", "max_hold": (0, 48),
+    "mean_reversion": {"timeframe": "5m", "order": "limit", "max_hold": (0, 48),
                        "strategies": ["vwap_revert", "bb_revert", "rsi_divergence"]},
-    "trend_pullback": {"timeframe": "15m", "order": "market", "max_hold": (0, 96),
+    "trend_pullback": {"timeframe": "5m", "order": "market", "max_hold": (0, 96),
                        "strategies": ["trend_pullback", "supertrend", "ema_cross"]},
-    "session_breakout": {"timeframe": "15m", "order": "stop", "max_hold": (0, 96),
+    "session_breakout": {"timeframe": "5m", "order": "stop", "max_hold": (0, 96),
                          "strategies": ["orb", "pivot_breakout"]},
-    "news": {"timeframe": "15m", "order": "market", "max_hold": (0, 32), "strategies": ["news_event"]},
-    "fade": {"timeframe": "15m", "order": "stop", "max_hold": (0, 32),
+    "news": {"timeframe": "5m", "order": "market", "max_hold": (0, 32), "strategies": ["news_event"]},
+    "fade": {"timeframe": "5m", "order": "stop", "max_hold": (0, 32),
              "strategies": ["expansion_fade", "hammer", "engulfing"]},
-    "grid": {"timeframe": "15m", "order": "limit", "max_hold": (0, 96), "strategies": ["grid"]},
-    "expansion": {"timeframe": "15m", "order": "stop", "max_hold": (0, 48),
+    "grid": {"timeframe": "5m", "order": "limit", "max_hold": (0, 96), "strategies": ["grid"]},
+    "expansion": {"timeframe": "5m", "order": "stop", "max_hold": (0, 48),
                   "strategies": ["vol_expansion", "squeeze_release", "expansion_fade"]},
-    "any": {"timeframe": "15m", "order": "market", "max_hold": (0, 96), "strategies": None},  # catálogo todo
+    "cross_section": {"timeframe": "5m", "order": "market", "max_hold": (12, 96),
+                      "strategies": ["xs_momentum", "funding_reversal"]},
+    "any": {"timeframe": "5m", "order": "market", "max_hold": (0, 96), "strategies": None},  # catálogo todo
 }
 STYLE_DESCRIPTIONS = {
     "scalping": "1m candles, tiny stops/targets, LIMIT (maker 0.02%) entries, holds minutes",
-    "momentum": "intraday momentum/breakout on 15m",
+    "momentum": "intraday momentum/breakout on 5m",
     "mean_reversion": "range trading back to VWAP / Bollinger mean, LIMIT entries",
     "trend_pullback": "trend following, entering on pullbacks",
     "session_breakout": "opening range / pivot breakout with STOP-ENTRY orders",
@@ -106,13 +127,15 @@ STYLE_DESCRIPTIONS = {
     "fade": "reversal after exhausted extreme moves (STOP-ENTRY against)",
     "grid": "bounded limit-order grid around VWAP",
     "expansion": "volatility expansion / squeeze release with STOP-ENTRY orders",
-    "any": "any strategy of the catalog on 15m",
+    "cross_section": "relative strength across a coin basket and crowded-funding reversals (needs market features)",
+    "any": "any strategy of the catalog on 5m",
 }
 STAND_ASIDE = "stand_aside"
 
 
 def eligible(style: str) -> list[str]:
-    return STYLES[style]["strategies"] or [k for k in DAY_STRATEGIES if k != "grid"]
+    # "any" não inclui grid nem as estratégias de mercado (essas só têm sinal com as features mkt_)
+    return STYLES[style]["strategies"] or [k for k in DAY_STRATEGIES if k != "grid" and k not in MARKET_STRATEGIES]
 DIRECTIONS = ("long", "short", "both")
 LEVERAGE_RANGE = (1.0, 10.0)  # o gate corta no teto dele
 STOP_RANGE = (0.002, 0.05)
@@ -125,6 +148,10 @@ DAILY_TARGET_RANGE = (0.01, 3.0)  # 1.0 = +100% no dia
 MAX_HOLD_RANGE = (0, 96)  # candles; 0 = sem limite
 MULT_RANGE = (0.25, 3.0)
 PRESSURE_RANGE = (0.0, 3.0)
+LOCK_AT_RANGE = (0.3, 5.0)  # em R
+LOCK_KEEP_RANGE = (0.0, 0.9)
+RUNNER_VOL_RANGE = (0.5, 0.99)  # percentil do ATR
+RUNNER_ATR_RANGE = (0.5, 6.0)
 
 
 def _clamp(v: float, b: tuple[float, float]) -> float:
@@ -151,6 +178,10 @@ class DayGenome:
     # estilo, execução e saída
     style: str = "any"
     trail: float | None = None  # trailing stop, fração do preço
+    lock_at: float | None = None  # trava de lucro a partir deste ganho, em R
+    lock_keep: float = 0.5  # fração do ganho máximo garantida pela trava
+    runner_vol: float | None = None  # percentil do ATR que cancela o alvo e deixa correr
+    runner_atr: float = 2.0  # distância do stop no modo "deixa correr", em ATRs
     entry_offset: float = 0.0005  # limit abaixo/acima do fechamento; stop-entry além do gatilho
     order_expiry: int = 3  # candles até a ordem de entrada não executada expirar
     slippage: float = 0.0002  # em ordens stop-entry
@@ -162,6 +193,8 @@ class DayGenome:
     event_blackout: int = 0  # minutos antes de evento agendado sem novas entradas
     news_size_mult: float = 0.0  # escala o risco pela confiança da notícia
     black_weight: float = 0.0  # quanto as features black_ pesam (0 no braço só-confiável)
+    # aglomeração: não compra com funding >= crowd_block bps, não vende com funding <= -crowd_block (None = desligado)
+    crowd_block: float | None = None
 
     def __post_init__(self) -> None:
         if self.strategy not in DAY_STRATEGIES:
@@ -220,6 +253,10 @@ class DayGenome:
             after_loss_mult=round(_clamp(self.after_loss_mult, MULT_RANGE), 3),
             goal_pressure=round(_clamp(self.goal_pressure, PRESSURE_RANGE), 3),
             trail=None if self.trail is None else round(_clamp(self.trail, STOP_RANGE), 5),
+            lock_at=None if self.lock_at is None else round(_clamp(self.lock_at, LOCK_AT_RANGE), 3),
+            lock_keep=round(_clamp(self.lock_keep, LOCK_KEEP_RANGE), 3),
+            runner_vol=None if self.runner_vol is None else round(_clamp(self.runner_vol, RUNNER_VOL_RANGE), 3),
+            runner_atr=round(_clamp(self.runner_atr, RUNNER_ATR_RANGE), 3),
             entry_offset=round(_clamp(self.entry_offset, (0.0, 0.01)), 5),
             order_expiry=int(round(_clamp(self.order_expiry, (1, 20)))),
             slippage=round(_clamp(self.slippage, (0.0, 0.005)), 5),
@@ -228,6 +265,7 @@ class DayGenome:
             event_blackout=int(round(_clamp(self.event_blackout, (0, 240)))),
             news_size_mult=round(_clamp(self.news_size_mult, (0.0, 2.0)), 3),
             black_weight=round(_clamp(self.black_weight, (0.0, 1.0)), 3),
+            crowd_block=None if self.crowd_block is None else round(_clamp(self.crowd_block, (0.5, 50.0)), 2),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -256,6 +294,10 @@ class DayGenome:
             goal_pressure=float(d.get("goal_pressure", 0.0)),
             style=d.get("style", "any"),
             trail=opt("trail"),
+            lock_at=opt("lock_at"),
+            lock_keep=float(d.get("lock_keep", 0.5)),
+            runner_vol=opt("runner_vol"),
+            runner_atr=float(d.get("runner_atr", 2.0)),
             entry_offset=float(d.get("entry_offset", 0.0005)),
             order_expiry=int(d.get("order_expiry", 3)),
             slippage=float(d.get("slippage", 0.0002)),
@@ -265,6 +307,7 @@ class DayGenome:
             event_blackout=int(d.get("event_blackout", 0)),
             news_size_mult=float(d.get("news_size_mult", 0.0)),
             black_weight=float(d.get("black_weight", 0.0)),
+            crowd_block=opt("crowd_block"),
         ).normalized()
 
     def warmup_bars(self, bars_per_day: int) -> int:
@@ -283,7 +326,7 @@ def random_regime_map(rng: random.Random, style: str) -> dict[str, str]:
 
 def random_day_genome(
     rng: random.Random, strategy: str | None = None, style: str | None = None, styles: list[str] | None = None,
-    news: bool = False, black: bool = False,
+    news: bool = False, black: bool = False, market: bool = False,
 ) -> DayGenome:
     style = style or rng.choice(styles or sorted(STYLES))
     strategy = strategy if strategy in eligible(style) else rng.choice(eligible(style))
@@ -307,6 +350,10 @@ def random_day_genome(
         goal_pressure=rng.choice([0.0, rng.uniform(0.0, 2.0)]),
         style=style,
         trail=rng.choice([None, rng.uniform(0.002, 0.02)]),
+        lock_at=rng.choice([None, rng.uniform(0.5, 3.0)]),
+        lock_keep=rng.uniform(0.2, 0.7),
+        runner_vol=rng.choice([None, rng.uniform(0.7, 0.97)]),
+        runner_atr=rng.uniform(1.0, 4.0),
         entry_offset=rng.uniform(0.0, 0.002),
         order_expiry=rng.randint(1, 6),
         slippage=rng.uniform(0.0, 0.001),
@@ -316,6 +363,7 @@ def random_day_genome(
         event_blackout=rng.choice([0, rng.randint(15, 120)]) if news else 0,
         news_size_mult=rng.choice([0.0, rng.uniform(0.0, 1.0)]) if news else 0.0,
         black_weight=rng.uniform(0.0, 1.0) if black else 0.0,
+        crowd_block=rng.choice([None, rng.uniform(1.0, 20.0)]) if market else None,
     )
     if scalp:  # alvos e stops minúsculos, segura minutos
         g = replace(g, stop=rng.uniform(0.002, 0.006), take_profit=rng.uniform(1.0, 2.5), max_hold=rng.randint(lo, hi),
@@ -354,6 +402,11 @@ def mutate_day(g: DayGenome, rng: random.Random, scale: float = 0.15, styles: li
         g,
         regime_map=regime_map,
         trail=jo(g.trail),
+        lock_at=(rng.uniform(0.5, 3.0) if g.lock_at is None else None) if rng.random() < scale / 3 else jo(g.lock_at),
+        lock_keep=g.lock_keep + rng.gauss(0, scale / 2),
+        runner_vol=(rng.uniform(0.7, 0.97) if g.runner_vol is None else None) if rng.random() < scale / 3
+        else (None if g.runner_vol is None else g.runner_vol + rng.gauss(0, scale / 4)),
+        runner_atr=j(g.runner_atr),
         entry_offset=g.entry_offset * math.exp(rng.gauss(0, scale)),
         order_expiry=round(j(g.order_expiry)),
         slippage=g.slippage,
@@ -362,6 +415,7 @@ def mutate_day(g: DayGenome, rng: random.Random, scale: float = 0.15, styles: li
         event_blackout=0 if g.event_blackout == 0 else round(j(g.event_blackout)),
         news_size_mult=g.news_size_mult * math.exp(rng.gauss(0, scale)),
         black_weight=min(1.0, max(0.0, g.black_weight + rng.gauss(0, scale / 2))) if black_allowed else 0.0,
+        crowd_block=jo(g.crowd_block),
     )
     return replace(
         g,
@@ -586,6 +640,28 @@ def signals(
                 long_, short = ok & _cross_up(s_, thr), ok & _cross_down(s_, -thr)
         case "grid":
             long_ = short = pd.Series(False, index=c.index)  # o grid é conduzido pelo backtest
+        case "xs_momentum":
+            col = f"mkt_xs_rank_{XS_LOOKBACK_CHOICES[int(p['lookback'])]}"
+            if col not in candles.columns:
+                long_ = short = pd.Series(False, index=c.index)
+            else:
+                rank = candles[col].astype(float)
+                top = p["top_pct"] / 100
+                long_, short = _cross_up(rank, 1 - top), _cross_down(rank, top)
+                exit_ = _sign_flip(rank - 0.5)  # voltou para o meio da cesta
+        case "funding_reversal":
+            if "mkt_funding_bps" not in candles.columns:
+                long_ = short = pd.Series(False, index=c.index)
+            else:
+                fb = candles["mkt_funding_bps"].astype(float)
+                thr = float(p["funding_bps"])
+                if p["oi_z10"] > 0 and "mkt_oi_z" in candles.columns:
+                    spike = candles["mkt_oi_z"].astype(float) >= p["oi_z10"] / 10
+                else:
+                    spike = pd.Series(True, index=c.index)
+                short = _cross_up(fb, thr - 1e-9) & spike  # longs aglomerados pagando: aposta na reversão
+                long_ = _cross_down(fb, -thr + 1e-9) & spike
+                exit_ = _sign_flip(fb)
         case _:
             raise AssertionError(strategy)
 

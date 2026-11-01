@@ -8,7 +8,7 @@ import pytest
 from trader.news import gkg
 from trader.news.enrich import Enricher
 from trader.news.pipeline import load_items
-from trader.news.store import NewsStore
+from trader.news.store import NewsStore, make_frame
 
 
 def gkg_line(date="20240110120000", domain="reuters.com", url="https://reuters.com/a", title="Bitcoin ETF approved",
@@ -39,7 +39,11 @@ def test_filter_keeps_whitelisted_and_relevant_only():
         gkg_line(title="Copom mantém Selic", domain="valor.globo.com", url="https://valor.globo.com/x",
                  translation="srclc:por;eng:GT-POR 1.0"),
     ], "translation", NOW)
-    assert [r["domain"] for r in rows] == ["reuters.com", "valor.globo.com"]
+    assert [r["domain"] for r in rows] == ["reuters.com", "random-blog.xyz", "valor.globo.com"]
+    frame = make_frame(rows, keep_unlisted=True)
+    assert frame.set_index("domain")["tier"].to_dict() == {"reuters.com": 1, "random-blog.xyz": 9, "valor.globo.com": 1}
+    assert len(make_frame(rows)) == 2  # padrão: fora da lista é descartado
+    rows = [r for r in rows if r["domain"] != "random-blog.xyz"]
     assert rows[0]["query_assets"] == "BTC" and rows[0]["gkg_tone"] == 3.5
     assert rows[1]["original_lang"] == "pt" and rows[1]["query_assets"] == "IBOV,USDBRL"
     assert rows[0]["published_at"] == pd.Timestamp("2024-01-10 12:00", tz="UTC") and rows[0]["backfilled"]
@@ -84,8 +88,9 @@ def test_run_is_resumable_and_writes_only_filtered_rows(tmp_path):
         return blobs[url]
 
     stats = gkg.run(tmp_path, files, download=fake_download, log=lambda m: None, flush_every=1, retries=2)
-    assert stats["files"] == 3 and stats["rows"] == 3 and stats["failed"] == 0
-    assert len(NewsStore(tmp_path, subdir=gkg.SUBDIR).read_all()) == 3
+    assert stats["files"] == 3 and stats["rows"] == 6 and stats["failed"] == 0
+    stored = NewsStore(tmp_path, subdir=gkg.SUBDIR).read_all()
+    assert (stored["tier"] == 1).sum() == 3 and (stored["tier"] == 9).sum() == 1  # spam.xyz: mesma URL, 1 id
     calls.clear()
     again = gkg.run(tmp_path, files, download=fake_download, log=lambda m: None)
     assert calls == [] and again["files"] == 0  # manifesto: nada a refazer
@@ -125,3 +130,31 @@ def test_select_for_llm_prefers_tier1_and_high_impact_with_daily_cap():
     })
     chosen = select_for_llm(items, daily_cap=1)
     assert chosen["id"].tolist() == ["c", "d"]  # dia 1: nível 1 + política monetária; dia 2: o único
+
+
+def test_priority_plan_order_and_stop_file(tmp_path):
+    mk = lambda ts: gkg.RemoteFile(f"http://x/{ts}.gkg.csv.zip", 1, "m", "en")
+    files = [mk(t) for t in ["20160101000000", "20210701000000", "20221115000000", "20260901000000"]]
+    order = [f.stamp[:6] for f in gkg.plan_priority(files, pd.Timestamp("2026-09-29", tz="UTC"))]
+    assert order == ["202609", "202211", "202107", "201601"]  # recente, evento (FTX), resto 2020+, antes de 2020
+    stop = tmp_path / "STOP"
+    stop.touch()
+    blob, md5 = zipped([gkg_line()])
+    many = [gkg.RemoteFile(f"http://x/2024011012{m:02d}00.gkg.csv.zip", len(blob), md5, "en") for m in range(0, 60, 15)]
+    stats = gkg.run(tmp_path, many, download=lambda u, b: blob, log=lambda m: None, workers=1, stop_file=stop)
+    assert stats["files"] == 2  # só os já enviados (workers*2) terminam
+
+
+def test_unlisted_items_are_excluded_from_features(tmp_path):
+    from trader.news.features import news_features
+    rows = [
+        {"source": "t", "domain": "reuters.com", "url": "https://reuters.com/1", "original_lang": "en",
+         "original_text": "bitcoin rally", "published_at": pd.Timestamp("2024-01-10 12:00", tz="UTC"),
+         "first_seen_at": NOW, "backfilled": True, "query_assets": "BTC"},
+        {"source": "t", "domain": "farm.xyz", "url": "https://farm.xyz/1", "original_lang": "en",
+         "original_text": "bitcoin to the moon", "published_at": pd.Timestamp("2024-01-10 12:00", tz="UTC"),
+         "first_seen_at": NOW, "backfilled": True, "query_assets": "BTC"},
+    ]
+    NewsStore(tmp_path).write(make_frame(rows, keep_unlisted=True))
+    idx = pd.DatetimeIndex([pd.Timestamp("2024-01-10 13:00", tz="UTC")])
+    assert news_features("BTC/USDT", "15m", idx, data=tmp_path, use_reputation=False)["news_count_1h"].iloc[0] == 1

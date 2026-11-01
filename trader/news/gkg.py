@@ -32,8 +32,8 @@ from typing import Callable, Iterable, Iterator
 
 import pandas as pd
 
-from trader.news.sources import tier_of
 from trader.news.store import NewsStore, make_frame
+from trader.storage.atomic import unique_tmp
 
 BASE = "https://data.gdeltproject.org/gdeltv2/"
 MASTER = {"en": BASE + "masterfilelist.txt", "translation": BASE + "masterfilelist-translation.txt"}
@@ -152,7 +152,7 @@ def load_file_list(
     if not fresh:
         cache_dir.mkdir(parents=True, exist_ok=True)
         req = urllib.request.Request(MASTER[feed], headers={"User-Agent": "ai-trader-research/0.1"})
-        tmp = cache.with_suffix(".tmp")
+        tmp = unique_tmp(cache)
         with urllib.request.urlopen(req, timeout=600) as resp, tmp.open("w", encoding="utf-8") as out:
             def lines():
                 while raw := resp.readline():
@@ -167,6 +167,33 @@ def load_file_list(
     for line in cache.read_text(encoding="utf-8").splitlines():
         size, md5, url = line.split("\t")
         out.append(RemoteFile(url, int(size), md5, feed))
+    return out
+
+
+# meses de eventos fortes para cripto, Brasil e macro (priorizados depois dos últimos 12 meses)
+EVENT_MONTHS = [
+    "2020-03", "2020-04", "2021-01", "2021-05", "2022-05", "2022-06", "2022-11", "2023-03",
+    "2024-01", "2024-03", "2024-04", "2024-08", "2024-12", "2025-04",
+]
+
+
+def plan_priority(files: list[RemoteFile], now: pd.Timestamp, recent: pd.Timedelta = pd.Timedelta(days=365)) -> list[RemoteFile]:
+    """Últimos 12 meses → meses de eventos → resto desde 2020 → 2015-02..2019-12. Sem repetições."""
+    fmt = "%Y%m%d%H%M%S"
+    by_key = lambda f: (f.stamp, f.feed)
+    ordered = sorted(files, key=by_key)
+    hi = now.strftime(fmt)
+    segments = [((now - recent).strftime(fmt), hi)]
+    for m in EVENT_MONTHS:
+        start = pd.Timestamp(m + "-01", tz="UTC")
+        segments.append((start.strftime(fmt), (start + pd.offsets.MonthBegin(1)).strftime(fmt)))
+    segments += [("20200101000000", hi), (GKG_START.strftime(fmt), "20200101000000")]
+    seen, out = set(), []
+    for lo, up in segments:
+        for f in ordered:
+            if lo <= f.stamp < up and f.url not in seen:
+                seen.add(f.url)
+                out.append(f)
     return out
 
 
@@ -209,9 +236,6 @@ def filter_rows(lines: Iterable[str], feed: str, now: pd.Timestamp) -> list[dict
         if len(r) < 27:
             continue
         domain = r[C_DOMAIN].lower()
-        tier = tier_of(domain)
-        if tier is None:
-            continue
         m = _TITLE_RE.search(r[C_XML])
         title = " ".join(m.group(1).split()) if m else ""
         orgs, persons = r[C_ORGS], r[C_PERSONS]
@@ -294,13 +318,18 @@ def run(
     log: Callable[[str], None] = print,
     download: Callable[[str, Bandwidth], bytes] = _download,
     retries: int = 4,
+    stop_file: Path | None = None,
 ) -> dict:
-    """Processa a lista (pula os já feitos). Retorna estatísticas desta execução."""
+    """Processa a lista (pula os já feitos). Retorna estatísticas desta execução.
+
+    Se `stop_file` passar a existir, termina os downloads em andamento, grava e sai.
+    """
     root = data / "news" / SUBDIR
     manifest = Manifest(root / "manifest.sqlite")
     store = NewsStore(data, subdir=SUBDIR)
     done = manifest.done()
     todo = [f for f in files if f.url not in done]
+    already = len(files) - len(todo)  # concluídos em execuções anteriores (manifesto)
     bandwidth = Bandwidth(max_mbps * 1024 * 1024)
     stats = {"files": 0, "failed": 0, "bytes": 0, "rows": 0, "start": time.monotonic(), "todo": len(todo)}
     todo_bytes = sum(f.size for f in todo)
@@ -322,7 +351,7 @@ def run(
 
     def flush() -> None:
         if pending_rows:
-            frame = make_frame(pending_rows)
+            frame = make_frame(pending_rows, keep_unlisted=True)
             store.write(frame)
         manifest.mark(pending_marks)
         pending_rows.clear()
@@ -333,9 +362,11 @@ def run(
         rate = stats["bytes"] / el if el else 0
         left = todo_bytes - stats["bytes"]
         eta = pd.Timedelta(seconds=left / rate) if rate else None
+        total_done = already + stats["files"]
         log(
-            f"{stats['files']}/{len(todo)} arquivos, {stats['failed']} falhas, {stats['bytes'] / 1e9:.2f} GB,"
-            f" {stats['rows']} linhas mantidas, {rate / 1e6:.2f} MB/s, ETA {str(eta).split('.')[0] if eta else '?'}"
+            f"TOTAL {total_done}/{len(files)} arquivos ({total_done / max(len(files), 1):.1%})"
+            f" | nesta execução: {stats['files']} arquivos, {stats['failed']} falhas, {stats['bytes'] / 1e9:.2f} GB,"
+            f" {stats['rows']} linhas | {rate / 1e6:.2f} MB/s, faltam ~{str(eta).split('.')[0] if eta else '?'}"
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -356,7 +387,7 @@ def run(
                     pending_rows.extend(rows)
                     pending_marks.append((f.url, "done", f.size, len(rows), ""))
                 since_flush += 1
-                nxt = next(it, None)
+                nxt = None if stop_file is not None and stop_file.exists() else next(it, None)
                 if nxt is not None:
                     running.add(pool.submit(job, nxt))
             if since_flush >= flush_every:

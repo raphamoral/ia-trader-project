@@ -60,6 +60,21 @@ def main(argv: list[str] | None = None) -> None:
         add_common(sp)
     exp.add_argument("--population-exp", type=int, default=12)
 
+    live = sub.add_parser("live", help="evolução ao vivo em papel, 24h (nenhuma ordem real)")
+    live.add_argument("--style", choices=["day", "scalp"], default="day", help="day = 5m, scalp = 1m com ordens limit")
+    live.add_argument("--symbol", default="SOL/USDT")
+    live.add_argument("--extra-symbols", default="")
+    live.add_argument("--features", choices=["none", "white", "all"], default="none")
+    live.add_argument("--db", type=Path, default=None)
+    live.add_argument("--bootstrap", type=Path, default=None)
+    live.add_argument("--capital-brl", type=float, default=1000.0)
+    live.add_argument("--brl-rate", type=float, default=5.5)
+    live.add_argument("--max-leverage", type=float, default=3.0)
+    live.add_argument("--workers", type=int, default=2)
+    live.add_argument("--llm-url", default="http://localhost:11434/v1")
+    live.add_argument("--llm-model", default="qwen2.5:7b")
+    live.add_argument("--no-llm", action="store_true", help="Criador só por regras")
+
     args = parser.parse_args(argv)
     if args.command == "collect":
         start = pd.Timestamp(args.since, tz="UTC")
@@ -68,6 +83,17 @@ def main(argv: list[str] | None = None) -> None:
         print(f"{args.symbol} {args.timeframe}: +{added} candles; funding: +{fund}")
     elif args.command == "experiment":
         experiment(args)
+    elif args.command == "live":
+        from trader.daytrade.live import DayLiveConfig, run
+
+        db = args.db or args.data / "live" / f"daytrade-{args.style}.sqlite"
+        config = DayLiveConfig(
+            style=args.style, symbol=args.symbol, features=args.features,
+            extra_symbols=tuple(x for x in args.extra_symbols.split(",") if x),
+            capital_brl=args.capital_brl, brl_rate=args.brl_rate, max_leverage=args.max_leverage,
+            llm_url=args.llm_url, llm_model=args.llm_model, llm=not args.no_llm, workers=args.workers,
+        )
+        run(args.data, db, config, args.bootstrap)
     else:
         evolve(args)
 
@@ -84,7 +110,7 @@ def add_common(evo: argparse.ArgumentParser) -> None:
     evo.add_argument("--max-leverage", type=float, default=3.0, help="teto congelado do gate")
     evo.add_argument("--max-risk", type=float, default=0.02, help="teto congelado de risco por operação")
     evo.add_argument("--daily-loss", type=float, default=0.05, help="teto congelado de perda diária")
-    evo.add_argument("--capital-brl", type=float, default=100.0)
+    evo.add_argument("--capital-brl", type=float, default=1000.0)
     evo.add_argument("--brl-rate", type=float, default=5.5, help="reais por USDT")
     evo.add_argument("--fitness", choices=[*MODES, "all"], default="risk")
     evo.add_argument("--ladder-min-days", type=int, default=60)
@@ -97,6 +123,10 @@ def add_common(evo: argparse.ArgumentParser) -> None:
     evo.add_argument("--styles", default="any", help="lista separada por vírgula, ou all")
     evo.add_argument("--news", choices=["none", "stub", "real"], default="none")
     evo.add_argument("--evo-start", default=None, help="início da evolução (ex.: 2025-01-01)")
+    evo.add_argument("--market", action="store_true",
+                     help="features de mercado: momentum entre moedas (cesta) e funding/OI (estilo cross_section, gene crowd_block)")
+    evo.add_argument("--until", default=None,
+                     help="fim dos dados usados (ex.: 2026-07-01): o holdout termina aqui, dentro da cobertura de notícias")
 
 
 class Setup:
@@ -104,7 +134,10 @@ class Setup:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.candles = CandleStore(args.data).read(data.EXCHANGE, args.symbol, args.timeframe)
+        lo = None if not args.evo_start else pd.Timestamp(args.evo_start, tz="UTC") - pd.Timedelta(days=35)
+        # 1m/5m: só o intervalo necessário (RAM apertada)
+        hi = None if not getattr(args, "until", None) else pd.Timestamp(args.until, tz="UTC")
+        self.candles = CandleStore(args.data).read(data.EXCHANGE, args.symbol, args.timeframe, start=lo, end=hi)
         if self.candles.empty:
             raise SystemExit(f"sem dados: python -m trader.daytrade collect {args.symbol} {args.timeframe}")
         self.funding = funding_lookup(data.read_funding(args.data, args.symbol))
@@ -138,6 +171,13 @@ class Setup:
     def loader(self, timeframe: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         """Candles de outro timeframe por intervalo de datas (1m não cabe inteiro na RAM)."""
         return CandleStore(self.args.data).read(data.EXCHANGE, self.args.symbol, timeframe, start, end)
+
+    def market_providers(self) -> list:
+        if not getattr(self.args, "market", False):
+            return []
+        from trader.daytrade.market_signals import crowding_provider, xs_provider
+
+        return [xs_provider(self.args.data), crowding_provider(self.args.data)]
 
     def providers_for(self, arm: str | None = None) -> list:
         mode = self.args.news
@@ -192,13 +232,14 @@ def evolve(args: argparse.Namespace) -> None:
 def run_mode(st: Setup, mode: str, executor, arm: str | None = None, seeds: list[int] | None = None,
              population: int | None = None) -> dict:
     args = st.args
-    providers = st.providers_for(arm)
-    has_black = any(getattr(p, "__name__", "").startswith(("stub_black", "black_")) for p in providers)
+    news_providers = st.providers_for(arm)
+    has_black = any(getattr(p, "__name__", "").startswith(("stub_black", "black_")) for p in news_providers)
+    providers = news_providers + st.market_providers()
     config = DayConfig(
         initial=population or args.population, max_slots=args.slots if population is None else population + 8,
         limits=st.limits, fitness=mode, cash=st.cash,
         capital_brl=args.capital_brl, spec=st.spec, brl_rate=args.brl_rate, ladder=st.ladder,
-        styles=st.styles, news=bool(providers), black=has_black,
+        styles=st.styles, news=bool(news_providers), black=has_black, market=bool(st.market_providers()),
     )
     rows, totals = [], Counter()
     survivors: list = []
@@ -287,6 +328,9 @@ def report(st: Setup, results: dict) -> None:
           f" {base.liquidations:>3} {'sim' if base.ruined else 'não':>5} {base.score:>6.2f} │ {goal_cols(base)} │")
     print(f"{'c/s 1x':<6} {'':>3} {'':>8} {bh_ret:>+8.1%} {bh_dd:>6.1%} {'':>4} {'':>3} {'':>5}"
           f" {risk_adjusted(bh_ret, bh_dd):>6.2f} │")
+    bh_fee = (1 + bh_ret) * (1 - 0.0005) ** 2 - 1  # entrada e saída a mercado (taker)
+    print(f"{'c/s+tx':<6} {'':>3} {'':>8} {bh_fee:>+8.1%} {bh_dd:>6.1%} {'':>4} {'':>3} {'':>5}"
+          f" {risk_adjusted(bh_fee, bh_dd):>6.2f} │ comprar e segurar com taxa taker nos dois lados")
 
     print("\nAUDITORIA DE VAZAMENTO (sinais atrasados 1 candle)")
     for mode, res in results.items():

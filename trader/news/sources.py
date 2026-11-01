@@ -21,13 +21,25 @@ TIERS: dict[str, int] = {
     "asia.nikkei.com": 1, "nikkei.com": 1, "caixinglobal.com": 1, "scmp.com": 1, "en.yna.co.kr": 1,
     "yna.co.kr": 1, "handelsblatt.com": 1, "faz.net": 1, "expansion.com": 1, "cincodias.elpais.com": 1,
     "lesechos.fr": 1, "ilsole24ore.com": 1,
+    # imprensa geral de referência
+    "cnn.com": 1, "bbc.com": 1, "bbc.co.uk": 1, "nytimes.com": 1, "theguardian.com": 1, "washingtonpost.com": 1,
+    "straitstimes.com": 1, "elpais.com": 1, "lemonde.fr": 1, "spiegel.de": 1, "zeit.de": 1, "nhk.or.jp": 1,
+    "koreaherald.com": 1, "koreatimes.co.kr": 1, "japantimes.co.jp": 1, "abc.net.au": 1, "afr.com": 1,
+    "cnnbrasil.com.br": 1, "uol.com.br": 1, "oglobo.globo.com": 1, "poder360.com.br": 1, "moneytimes.com.br": 2,
+    # dados de mercado e imprensa financeira secundária
+    "finanzen.net": 2, "marketscreener.com": 2, "businessinsider.com": 2, "nasdaq.com": 2, "investing.com": 2,
+    "fxstreet.com": 2, "kitco.com": 2, "mining.com": 2, "oilprice.com": 2, "seekingalpha.com": 2,
+    "finance.yahoo.com": 2, "fortune.com": 2, "forbes.com": 2, "axios.com": 2, "politico.com": 2,
     # imprensa cripto estabelecida
     "coindesk.com": 2, "theblock.co": 2, "decrypt.co": 2, "blockworks.co": 2, "dlnews.com": 2,
     "cointelegraph.com": 2, "coinpost.jp": 2, "blockmedia.co.kr": 2, "btc-echo.de": 2,
     "criptonoticias.com": 2, "portaldobitcoin.uol.com.br": 2,
 }
 
-TIER_WEIGHT = {1: 1.0, 2: 0.6}
+# relevante mas fora da lista: guardado (o backfill não se repete barato), fora das features
+# por padrão; a reputação pode promover a fonte mais tarde
+UNLISTED_TIER = 9
+TIER_WEIGHT = {1: 1.0, 2: 0.6, UNLISTED_TIER: 0.0}
 
 
 def tier_of(domain: str) -> int | None:

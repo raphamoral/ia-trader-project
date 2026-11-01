@@ -24,6 +24,12 @@ TREND_RANGE = (20, 300)
 COOLDOWN_RANGE = (0, 60)
 VOL_FILTER_RANGE = (0.002, 0.2)
 SIZE_RANGE = (0.1, 1.0)
+# genes de notícia: neutros por padrão (sem as colunas, o motor ignora todos)
+NEWS_GATE_RANGE = (0.05, 0.9)
+NEWS_FOLLOW_RANGE = (0.1, 0.95)
+BLACKOUT_MIN_RANGE = (0, 240)
+BLACK_WEIGHT_RANGE = (0.0, 1.0)
+HACK_BLACKOUT_H_RANGE = (0, 48)
 
 
 def _clamp(value: float, bounds: tuple[float, float]) -> float:
@@ -38,6 +44,11 @@ class Genome:
     vol_filter: float | None = None  # não entra se a amplitude média (% do preço) passar disso
     trend_filter: int | None = None  # só compra acima da média de N candles
     cooldown: int = 0  # candles mínimos entre uma entrada e a próxima
+    news_gate: float | None = None  # não compra se o sentimento combinado estiver abaixo de -news_gate
+    news_follow: float | None = None  # compra mesmo sem sinal técnico se o sentimento passar de news_follow
+    event_blackout: int = 0  # minutos antes de evento agendado (Copom, FOMC, payroll) sem novas entradas
+    black_weight: float = 0.0  # peso do sentimento black no sentimento combinado
+    hack_blackout: int = 0  # horas após incidente de segurança sem novas entradas
 
     def __post_init__(self) -> None:
         if self.strategy not in STRATEGIES:
@@ -62,6 +73,11 @@ class Genome:
             vol_filter=None if self.vol_filter is None else round(_clamp(self.vol_filter, VOL_FILTER_RANGE), 5),
             trend_filter=None if self.trend_filter is None else int(_clamp(self.trend_filter, TREND_RANGE)),
             cooldown=int(_clamp(self.cooldown, COOLDOWN_RANGE)),
+            news_gate=None if self.news_gate is None else round(_clamp(self.news_gate, NEWS_GATE_RANGE), 3),
+            news_follow=None if self.news_follow is None else round(_clamp(self.news_follow, NEWS_FOLLOW_RANGE), 3),
+            event_blackout=int(_clamp(self.event_blackout, BLACKOUT_MIN_RANGE)),
+            black_weight=round(_clamp(self.black_weight, BLACK_WEIGHT_RANGE), 3),
+            hack_blackout=int(_clamp(self.hack_blackout, HACK_BLACKOUT_H_RANGE)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,6 +92,11 @@ class Genome:
             vol_filter=None if data.get("vol_filter") is None else float(data["vol_filter"]),
             trend_filter=None if data.get("trend_filter") is None else int(data["trend_filter"]),
             cooldown=int(data.get("cooldown", 0)),
+            news_gate=None if data.get("news_gate") is None else float(data["news_gate"]),
+            news_follow=None if data.get("news_follow") is None else float(data["news_follow"]),
+            event_blackout=int(data.get("event_blackout") or 0),
+            black_weight=float(data.get("black_weight") or 0.0),
+            hack_blackout=int(data.get("hack_blackout") or 0),
         ).normalized()
 
     @property
@@ -86,25 +107,74 @@ class Genome:
         return max(need, 16)
 
 
-def random_genome(rng: random.Random, strategy: str | None = None) -> Genome:
+def random_genome(rng: random.Random, strategy: str | None = None, priors: dict | None = None,
+                  prior_weight: float = 0.7) -> Genome:
+    """Genoma aleatório. Com `priors` (faixas vindas dos livros), cada gene cai na faixa sugerida
+    com probabilidade `prior_weight`, senão na faixa completa (para a evolução poder refutar)."""
+    priors = priors or {}
+
+    def draw(name: str, lo: float, hi: float, integer: bool) -> float:
+        p = priors.get(name)
+        if p and rng.random() < prior_weight:
+            lo2, hi2 = max(lo, float(p["low"])), min(hi, float(p["high"]))
+            if lo2 <= hi2:
+                lo, hi = lo2, hi2
+        return rng.randint(int(lo), int(hi)) if integer else rng.uniform(lo, hi)
+
     strategy = strategy or rng.choice(sorted(STRATEGIES))
-    params = {k: rng.randint(lo, hi) for k, (lo, hi) in STRATEGIES[strategy].items()}
+    params = {k: draw(f"{strategy}.{k}", lo, hi, True) for k, (lo, hi) in STRATEGIES[strategy].items()}
     return Genome(
         strategy=strategy,
         params=params,
-        size=rng.uniform(0.3, 1.0),
-        vol_filter=rng.choice([None, rng.uniform(0.01, 0.06)]),
-        trend_filter=rng.choice([None, rng.randint(50, 200)]),
-        cooldown=rng.choice([0, 0, rng.randint(1, 12)]),
+        size=draw("size", 0.3, 1.0, False),
+        vol_filter=rng.choice([None, draw("vol_filter", 0.01, 0.06, False)]),
+        trend_filter=rng.choice([None, draw("trend_filter", 50, 200, True)]),
+        cooldown=rng.choice([0, 0, draw("cooldown", 1, 12, True)]),
+        news_gate=rng.choice([None, rng.uniform(0.1, 0.6)]),
+        news_follow=rng.choice([None, None, rng.uniform(0.3, 0.9)]),
+        event_blackout=rng.choice([0, 0, rng.randint(15, 180)]),
+        black_weight=rng.choice([0.0, rng.uniform(0.1, 0.8)]),
+        hack_blackout=rng.choice([0, 0, rng.randint(2, 24)]),
     ).normalized()
 
 
-def mutate(genome: Genome, rng: random.Random, scale: float = 0.15) -> Genome:
-    """Pequena variação aleatória em cada gene (scale = desvio relativo)."""
+def random_news_genes(rng: random.Random, black: bool = True) -> dict:
+    """Valores aleatórios para os genes de notícia (black só quando permitido)."""
+    genes = {
+        "news_gate": rng.choice([None, rng.uniform(0.1, 0.6)]),
+        "news_follow": rng.choice([None, rng.uniform(0.3, 0.9)]),
+        "event_blackout": rng.choice([0, rng.randint(15, 180)]),
+    }
+    if black:
+        genes["black_weight"] = rng.choice([0.0, rng.uniform(0.1, 0.8)])
+        genes["hack_blackout"] = rng.choice([0, rng.randint(2, 24)])
+    if not any(v for v in genes.values()):
+        genes["news_gate"] = rng.uniform(0.1, 0.6)  # garante ao menos um gene ligado
+    return genes
+
+
+def mutate(genome: Genome, rng: random.Random, scale: float = 0.15, news_toggle: float = 0.15) -> Genome:
+    """Pequena variação aleatória em cada gene (scale = desvio relativo).
+
+    Genes de notícia também podem ser ligados/desligados (news_toggle), senão uma
+    população que nasceu sem eles nunca os descobriria.
+    """
 
     def jitter(value: float) -> float:
         return value * math.exp(rng.gauss(0, scale))
 
+    fresh = random_news_genes(rng)
+
+    def toggle(name: str, value, off):
+        if rng.random() < news_toggle:
+            return fresh[name] if value in (None, 0, 0.0) and fresh[name] not in (None, 0, 0.0) else off
+        return value
+
+    news_gate = toggle("news_gate", genome.news_gate, None)
+    news_follow = toggle("news_follow", genome.news_follow, None)
+    event_blackout = toggle("event_blackout", genome.event_blackout, 0)
+    black_weight = toggle("black_weight", genome.black_weight, 0.0)
+    hack_blackout = toggle("hack_blackout", genome.hack_blackout, 0)
     return replace(
         genome,
         params={k: jitter(v) for k, v in genome.params.items()},
@@ -112,6 +182,11 @@ def mutate(genome: Genome, rng: random.Random, scale: float = 0.15) -> Genome:
         vol_filter=None if genome.vol_filter is None else jitter(genome.vol_filter),
         trend_filter=None if genome.trend_filter is None else jitter(genome.trend_filter),
         cooldown=round(jitter(genome.cooldown + 1)) - 1,
+        news_gate=None if news_gate is None else jitter(news_gate),
+        news_follow=None if news_follow is None else jitter(news_follow),
+        event_blackout=round(jitter(event_blackout + 1)) - 1 if event_blackout else 0,
+        black_weight=jitter(black_weight) if black_weight else 0.0,
+        hack_blackout=round(jitter(hack_blackout + 1)) - 1 if hack_blackout else 0,
     ).normalized()
 
 
@@ -135,6 +210,24 @@ def range_pct(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 14)
     return float(((high[-n:] - low[-n:]) / close[-n:]).mean())
 
 
+def _last(c, column: str, default: float) -> float:
+    if column not in c.columns:
+        return default
+    value = c[column].iloc[-1]
+    return default if value != value else float(value)  # NaN → padrão
+
+
+def _news_context(c, g: Genome) -> dict[str, float]:
+    """Contexto de notícias no último candle fechado; neutro se as colunas não existirem."""
+    white = _last(c, "news_sentiment", 0.0)
+    black = _last(c, "black_rw_mean_sent", _last(c, "black_mean_sent", 0.0))
+    return {
+        "sentiment": white + g.black_weight * black,
+        "minutes_to_event": _last(c, "news_minutes_to_next_event", 1e9),
+        "minutes_since_hack": _last(c, "black_sec_minutes_since_incident", 1e9),
+    }
+
+
 class GenomeEngine:
     """Motor gerado por um genoma. Guarda estado entre candles (posição, cooldown)."""
 
@@ -155,9 +248,18 @@ class GenomeEngine:
         low = c["low"].to_numpy()
         self._since_entry += 1
 
+        news = _news_context(c, g)
         want = self._strategy_wants_long(close, high, low)
+        if not want and not self._long and g.news_follow is not None and news["sentiment"] >= g.news_follow:
+            want = True  # notícia forte a favor abre posição sem sinal técnico
         if want and not self._long:
-            if g.trend_filter and close[-1] < _sma(close, g.trend_filter):
+            if g.news_gate is not None and news["sentiment"] <= -g.news_gate:
+                want = False
+            elif g.event_blackout and news["minutes_to_event"] < g.event_blackout:
+                want = False
+            elif g.hack_blackout and news["minutes_since_hack"] < g.hack_blackout * 60:
+                want = False
+            elif g.trend_filter and close[-1] < _sma(close, g.trend_filter):
                 want = False
             elif g.vol_filter is not None and range_pct(high, low, close) > g.vol_filter:
                 want = False

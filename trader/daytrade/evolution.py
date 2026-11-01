@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import random
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,7 +29,7 @@ from trader.daytrade.backtest import GOAL_DAY, KellyCap, goal_metrics, run_daytr
 from trader.daytrade.creator import DayRuleCreator
 from trader.daytrade.gate import DayTradeLimits
 from trader.daytrade.genome import DayGenome, random_day_genome
-from trader.daytrade.market import NO_MINIMUM, SymbolSpec, brl_to_usdt
+from trader.daytrade.market import NO_MINIMUM, SymbolSpec, brl_to_usdt, spec_for
 from trader.domain import parse_timeframe
 from trader.evolution.fitness import (
     Life,
@@ -101,6 +103,53 @@ def _job(args: tuple) -> DayWindow:
     return evaluate_day(*args)
 
 
+def merge_windows(parts: list[DayWindow]) -> DayWindow:
+    """Um genoma operando vários ativos na mesma janela: carteira de pesos iguais."""
+    if len(parts) == 1:
+        return parts[0]
+    st = [p.stats for p in parts]
+    n = min(len(p.daily) for p in parts)
+    daily = np.mean([p.daily[:n] for p in parts], axis=0) if n else np.array([])
+
+    def add(pairs):
+        out: dict[str, float] = {}
+        for p in pairs:
+            for k, v in p:
+                out[k] = out.get(k, 0) + v
+        return tuple(out.items())
+
+    stats = WindowStats(
+        st[0].start, float(np.mean([s.ret for s in st])), float(np.mean([s.gross_ret for s in st])),
+        max(s.max_dd for s in st), sum(s.trades for s in st),
+        any(s.dd_high_vol for s in st), any(s.dd_market_down for s in st), float(np.mean([s.median_range for s in st])),
+    )
+    return DayWindow(
+        stats, sum(p.liquidations for p in parts), any(p.ruined for p in parts), daily,
+        sum(p.stop_days for p in parts), sum(p.max_trade_days for p in parts), sum(p.escalated_days for p in parts),
+        sum(p.escalated_ruin for p in parts), sum(p.escalated_double for p in parts),
+        tuple(r for p in parts for r in p.r_multiples), sum(p.fees for p in parts), sum(p.gross_pnl for p in parts),
+        sum(p.limit_placed for p in parts), sum(p.limit_filled for p in parts),
+        add(p.regime_bars for p in parts), add(p.regime_pnl for p in parts), sum(p.stand_aside_bars for p in parts),
+    )
+
+
+def _window_record(r: DayWindow) -> dict[str, Any]:
+    """O que vai para a tabela `life` do registro (o painel lê ret, max_dd, trades)."""
+    return {**asdict(r.stats), "x": {
+        "liq": r.liquidations, "ruined": r.ruined, "daily": [float(d) for d in r.daily],
+        "r": [float(x) for x in r.r_multiples[-200:]], "fees": r.fees, "gross": r.gross_pnl,
+        "limit_placed": r.limit_placed, "limit_filled": r.limit_filled,
+        "regime_pnl": dict(r.regime_pnl), "stop_days": r.stop_days, "max_trade_days": r.max_trade_days,
+    }}
+
+
+_STATS_FIELDS = {f for f in WindowStats.__dataclass_fields__}
+
+
+def _stats_from(rec: dict[str, Any]) -> WindowStats:
+    return WindowStats(**{k: (pd.Timestamp(v) if k == "start" else v) for k, v in rec.items() if k in _STATS_FIELDS})
+
+
 LADDER_BRL = (100.0, 1_000.0, 10_000.0, 100_000.0)
 
 
@@ -170,13 +219,15 @@ class DayConfig:
     limits: DayTradeLimits = DayTradeLimits()
     fitness: str = "risk"  # risk | goal
     cash: float = 10_000.0  # USDT
-    capital_brl: float = 100.0  # só para as métricas da meta
+    capital_brl: float = 1000.0  # só para as métricas da meta
     spec: SymbolSpec = NO_MINIMUM
     brl_rate: float = 5.5
+    creator_threads: int = 4
     ladder: LadderRules = LadderRules()
     styles: tuple[str, ...] = ("any",)  # estilos que podem nascer/ser escolhidos
     news: bool = False  # genes de notícia ativos (há provedores)
     black: bool = False  # genes black_weight evoluem (braços WB/WB')
+    market: bool = False  # há features mkt_ (momentum entre moedas, funding/OI): gene crowd_block evolui
 
 
 class DayPopulation:
@@ -229,28 +280,67 @@ class DayPopulation:
         self.alive.append(DayAgent(agent_id, genome, lineage))
         self.totals[f"style_born:{genome.style}"] += 1
 
-    def seed(self) -> None:
-        for _ in range(self.config.initial):
+    def seed(self, genomes: list[DayGenome] | None = None) -> None:
+        """`genomes`: sobreviventes de outra evolução (bootstrap); completa com aleatórios."""
+        genomes = list(genomes or [])[: self.config.initial]
+        for g in genomes:
+            self._born(g, "seed", note="bootstrap")
+        for _ in range(self.config.initial - len(genomes)):
             self._born(random_day_genome(self.rng, styles=list(self.config.styles), news=self.config.news,
-                                         black=self.config.black), "seed")
+                                         black=self.config.black, market=self.config.market), "seed")
+
+    def restore(self) -> bool:
+        """Retoma a população gravada no registro (vivos, históricos e referência)."""
+        alive = self.registry.alive()
+        if not alive:
+            return False
+        self.alive = []
+        for row in alive:
+            a = DayAgent(row["id"], DayGenome.from_dict(row["genome"]), row["lineage"])
+            for rec in self.registry.windows_of(a.id):
+                x = rec.get("x", {})
+                a.life.windows.append(_stats_from(rec))
+                a.daily.extend(x.get("daily", []))
+                a.r_history.extend(x.get("r", []))
+                a.liquidations += x.get("liq", 0)
+                a.fees += x.get("fees", 0.0)
+                a.gross_pnl += x.get("gross", 0.0)
+                a.limit_placed += x.get("limit_placed", 0)
+                a.limit_filled += x.get("limit_filled", 0)
+                a.stop_days += x.get("stop_days", 0)
+                a.max_trade_days += x.get("max_trade_days", 0)
+                for k, v in x.get("regime_pnl", {}).items():
+                    a.regime_pnl[k] = a.regime_pnl.get(k, 0.0) + v
+            self.alive.append(a)
+        self.baseline_windows = [_stats_from(r) for r in self.registry.windows_of("__baseline__")]
+        self._counter = self.registry.agent_count()
+        self._window = self.registry.next_window()
+        return True
 
     def cash_for(self, a: DayAgent | None) -> float:
         if self.config.fitness != "ladder" or a is None:
             return self.config.cash
         return brl_to_usdt(LADDER_BRL[a.rung], self.config.brl_rate)
 
-    def window_data(self, timeframe: str, start: pd.Timestamp, end: pd.Timestamp, warm_bars: int) -> pd.DataFrame:
+    @property
+    def baskets(self) -> dict[str, pd.DataFrame]:
+        """Ativos operados: `candles` pode ser um DataFrame (um ativo) ou {símbolo: DataFrame}."""
+        return self.candles if isinstance(self.candles, dict) else {self.symbol: self.candles}
+
+    def window_data(self, timeframe: str, start: pd.Timestamp, end: pd.Timestamp, warm_bars: int,
+                    symbol: str | None = None) -> pd.DataFrame:
+        symbol = symbol or self.symbol
         tf = parse_timeframe(timeframe)
         lo = start - tf * warm_bars
         if timeframe == self.timeframe or self.loader is None:
-            c = self.candles
+            c = self.baskets[symbol]
             data = c[(c["ts"] >= lo) & (c["ts"] < end)].reset_index(drop=True)
         else:
             data = self.loader(timeframe, lo, end).reset_index(drop=True)
         if self.providers and len(data):
             from trader.daytrade.features import attach_features
 
-            data = attach_features(data, self.symbol, timeframe, self.providers)
+            data = attach_features(data, symbol, timeframe, self.providers)
         return data
 
     def _evaluate(self, agents: list[DayAgent | None], start: pd.Timestamp, end: pd.Timestamp) -> list[DayWindow]:
@@ -260,23 +350,29 @@ class DayPopulation:
         kelly = cfg.ladder.kelly if cfg.fitness == "ladder" else None
         by_tf: dict[str, list[int]] = {}
         for k, g in enumerate(genomes):
-            by_tf.setdefault(g.timeframe, []).append(k)
-        results: list[DayWindow | None] = [None] * len(genomes)
+            # sem loader, todos operam no timeframe dos candles recebidos (ex.: ao vivo)
+            tf_ = g.timeframe if self.loader is not None else self.timeframe
+            by_tf.setdefault(tf_, []).append(k)
+        parts: list[list[DayWindow]] = [[] for _ in genomes]
+        symbols = list(self.baskets)
         for timeframe, idxs in by_tf.items():
             bpd = int(pd.Timedelta(days=1) / parse_timeframe(timeframe))
             warm = max(genomes[k].warmup_bars(bpd) for k in idxs)
-            data = self.window_data(timeframe, start, end, warm)
-            jobs = [
-                (genomes[k], data, self.symbol, timeframe, start, end, cfg.limits, self.funding,
-                 self.cash_for(agents[k]), cfg.spec,
-                 None if agents[k] is None else kelly, () if agents[k] is None else tuple(agents[k].r_history[-500:]))
-                for k in idxs
-            ]
-            out = [_job(j) for j in jobs] if self.executor is None else list(self.executor.map(_job, jobs))
-            for k, r in zip(idxs, out):
-                results[k] = r
-            del data, jobs
-        return results
+            for sym in symbols:
+                data = self.window_data(timeframe, start, end, warm, sym)
+                spec = cfg.spec if len(symbols) == 1 else spec_for(sym)
+                jobs = [
+                    (genomes[k], data, sym, timeframe, start, end, cfg.limits, self.funding if sym == self.symbol else None,
+                     self.cash_for(agents[k]), spec,
+                     None if agents[k] is None else kelly,
+                     () if agents[k] is None else tuple(agents[k].r_history[-500:]))
+                    for k in idxs
+                ]
+                out = [_job(j) for j in jobs] if self.executor is None else list(self.executor.map(_job, jobs))
+                for k, r in zip(idxs, out):
+                    parts[k].append(r)
+                del data, jobs
+        return [merge_windows(p) for p in parts]
 
     def _baseline_life(self, a: DayAgent) -> Life:
         return Life(self.baseline_windows[len(self.baseline_windows) - a.life.age :])
@@ -404,6 +500,12 @@ class DayPopulation:
             self.totals["escalated_ruin"] += r.escalated_ruin
             self.totals["escalated_double"] += r.escalated_double
 
+        # grava a janela de todos (o painel e o restore leem daqui)
+        self.registry.record_window("__baseline__", self._window, _window_record(results[-1]))
+        for a, r in zip(self.alive, results[:-1]):
+            self.registry.record_window(a.id, self._window, _window_record(r))
+        self.registry.commit()
+
         deaths: Counter[str] = Counter()
         births: Counter[str] = Counter()
         thrivers = []
@@ -411,6 +513,7 @@ class DayPopulation:
         for a, _ in evaluated:
             if a.life.age > 0 and (self.best_seen is None or self._key(a) > self._key(self.best_seen)):
                 self.best_seen = a
+        dead: list[tuple[DayAgent, dict[str, Any]]] = []
         for a, r in evaluated:
             cause, thrive = self._verdict(a, r)
             if thrive:
@@ -418,29 +521,64 @@ class DayPopulation:
                 if self.config.fitness == "ladder":
                     self._promote(a)
             if cause:
-                autopsy = self._kill(a, cause)
+                dead.append((a, self._kill(a, cause)))
                 deaths[cause] += 1
-                genome, note = self.creator.successor(a.genome, autopsy, self.rng)
-                self._born(genome, "successor", a, note)
-                births["successor"] += 1
+        # sucessores desenhados em paralelo (a LLM é o gargalo); semente fixa por tarefa
+        seeds = [self.rng.random() for _ in dead]
+        for (a, _), (genome, note) in zip(dead, self._parallel(
+            [(a.genome, autopsy, random.Random(sd)) for (a, autopsy), sd in zip(dead, seeds)], "successor"
+        )):
+            self._born(genome, "successor", a, note)
+            births["successor"] += 1
+        for a in thrivers:
+            if a in self.alive:
+                self.registry.induct(a.id, a.lineage, a.genome.to_dict(), self._success_report(a), a.life.score,
+                                     self._window)
 
         cap = max(2, int(self.config.max_slots * self.config.max_lineage_share))
+        parents: list[DayAgent] = []
         for a in sorted(thrivers, key=self._key, reverse=True):
-            if a not in self.alive or sum(x.lineage == a.lineage for x in self.alive) + 1 > cap:
+            fam = sum(x.lineage == a.lineage for x in self.alive) + sum(p.lineage == a.lineage for p in parents)
+            if a not in self.alive or fam + 1 > cap:
                 continue
-            if len(self.alive) >= self.config.max_slots:
-                others = [x for x in self.alive if x is not a and x.life.age > 0]
+            if len(self.alive) + len(parents) >= self.config.max_slots:
+                others = [x for x in self.alive if x is not a and x.life.age > 0 and x not in parents]
                 worst = min(others, key=self._key, default=None)
                 if worst is None or self._key(worst) >= self._key(a):
                     continue
                 self._kill(worst, "culled")
                 deaths["culled"] += 1
-            self._born(self.creator.child(a.genome, self.rng), "child", a, f"filho de {a.id}")
+            parents.append(a)
+        seeds = [self.rng.random() for _ in parents]
+        for a, child in zip(parents, self._parallel([(a.genome, random.Random(sd)) for a, sd in zip(parents, seeds)],
+                                                     "child")):
+            self._born(child, "child", a, f"filho de {a.id}")
             births["child"] += 1
 
         self._window += 1
         return {"index": self._window - 1, "start": start, "alive": len(self.alive),
                 "deaths": dict(deaths), "births": dict(births)}
+
+    def _parallel(self, tasks: list[tuple], kind: str) -> list:
+        """Chama o Criador em threads (LLM lenta); o registro é thread-safe."""
+        fn = self.creator.successor if kind == "successor" else self.creator.child
+        if len(tasks) <= 1 or self.config.creator_threads <= 1:
+            return [fn(*t) for t in tasks]
+        with ThreadPoolExecutor(max_workers=self.config.creator_threads) as pool:
+            return list(pool.map(lambda t: fn(*t), tasks))
+
+    def _success_report(self, a: DayAgent) -> dict[str, Any]:
+        """Por que prosperou: vai para a galeria e para o prompt do Criador."""
+        best_regime = max(a.regime_pnl.items(), key=lambda kv: kv[1], default=(None, 0.0))
+        return {
+            "genome": a.genome.to_dict(),
+            "life": {"windows": a.life.age, "trades": a.life.trades, "net_return": round(a.life.ret, 4),
+                     "worst_drawdown": round(a.life.worst_dd, 4), "score": round(a.life.score, 3),
+                     "benchmark_return": round(self._baseline_life(a).ret, 4), "style": a.genome.style,
+                     "maker_fill_rate": round(a.limit_filled / a.limit_placed, 3) if a.limit_placed else None},
+            "winning_context": {"best_regime": best_regime[0], "pnl": round(best_regime[1], 4),
+                                "regime_map": a.genome.regime_map},
+        }
 
     def champion(self) -> DayAgent | None:
         r = self.config.rules

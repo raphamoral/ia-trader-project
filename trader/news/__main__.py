@@ -76,6 +76,13 @@ def main(argv: list[str] | None = None) -> None:
     k.add_argument("--max-mbps", type=float, default=4.0, help="teto de banda total em MB/s")
     k.add_argument("--workers", type=int, default=2, help="downloads simultâneos (máx. 2)")
     k.add_argument("--max-files", type=int, help="processa no máximo N arquivos (para medir)")
+    k.add_argument("--priority", action="store_true",
+                   help="ordem: últimos 12 meses, meses de eventos, resto desde 2020, depois 2015-2019")
+
+    ft = sub.add_parser("fulltext", help="lê o texto completo das notícias recentes de nível 1/2 (respeita robots.txt)")
+    ft.add_argument("--limit", type=int, default=15, help="máximo de páginas lidas nesta execução")
+    ft.add_argument("--model", default="qwen2.5:7b")
+    ft.add_argument("--llm-url", default="http://localhost:11434/v1")
 
     r = sub.add_parser("reputation")
     r.add_argument("--as-of", required=True)
@@ -98,13 +105,19 @@ def main(argv: list[str] | None = None) -> None:
         files = []
         for feed in args.feeds.split(","):
             files += gkg.load_file_list(lists, feed, bandwidth=gkg.Bandwidth(args.max_mbps * 1024 * 1024))
-        todo = gkg.plan(files, since, until, then_earlier=not args.no_earlier)
+        if args.priority:
+            todo = gkg.plan_priority(files, until)
+        else:
+            todo = gkg.plan(files, since, until, then_earlier=not args.no_earlier)
         if args.max_files:
             todo = todo[: args.max_files]
         print(f"{len(todo)} arquivos no plano ({sum(f.size for f in todo) / 1e9:.1f} GB),"
               f" {since:%Y-%m-%d} → {until:%Y-%m-%d}{'' if args.no_earlier else ', depois 2015-02 → ' + f'{since:%Y-%m-%d}'}",
               flush=True)
-        stats = gkg.run(args.data, todo, max_mbps=args.max_mbps, workers=min(args.workers, 2),
+        stop = args.data / "news" / gkg.SUBDIR / "STOP"
+        stop.unlink(missing_ok=True)
+        print(f"para parar com segurança: crie o arquivo {stop}", flush=True)
+        stats = gkg.run(args.data, todo, max_mbps=args.max_mbps, workers=min(args.workers, 2), stop_file=stop,
                         log=lambda m: print(f"[{pd.Timestamp.now():%H:%M:%S}] {m}", flush=True))
         print(f"fim: {stats['files']} arquivos, {stats['failed']} falhas, {stats['rows']} linhas,"
               f" {stats['bytes'] / 1e9:.2f} GB em {stats['elapsed'] / 60:.1f} min", flush=True)
@@ -140,6 +153,15 @@ def main(argv: list[str] | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         events.to_parquet(path, index=False)
         print(events.groupby("event").size().to_dict(), "->", path)
+    elif args.cmd == "fulltext":
+        from trader.news.fulltext import fetch_and_label
+        from trader.news.pipeline import read_items
+
+        recent = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=2)  # o texto completo só é lido para notícias de até 24h
+        stats = fetch_and_label(args.data, read_items(args.data, since=recent),
+                                Enricher(args.data, base_url=args.llm_url, model=args.model),
+                                limit=args.limit)
+        print("texto completo:", stats)
     elif args.cmd == "enrich":
         enricher = Enricher(args.data, base_url=args.llm_url, model=args.model)
         if args.history_daily_cap:
@@ -160,7 +182,8 @@ def main(argv: list[str] | None = None) -> None:
         items = store.read_all()
         pending = items[[enricher.key(t) not in enricher.cache for t in items["original_text"]]]
         if len(pending) > args.limit:
-            base = load_items(args.data, enricher, latency)
+            # reputação para priorizar: bastam os últimos meses (não o GDELT inteiro)
+            base = load_items(args.data, enricher, latency, since=pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=120))
             rep = build_reputation(args.data, base, pd.Timedelta(args.horizon))
             chosen = rep.priority(pd.Timestamp.now(tz="UTC"), pending.reset_index(drop=True), args.limit, random.Random(0))
             pending = pending.reset_index(drop=True).loc[chosen]

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from trader.storage.atomic import replace_with_retry, unique_tmp
 
 TIER = "black"
 SOURCE_KINDS = ("social", "blog", "farm")
@@ -113,9 +114,9 @@ class BlackStore:
                 part = pd.concat([old, part])
             part = part.drop_duplicates("id", keep="last").sort_values("published_at").reset_index(drop=True)
             added += len(part) - before
-            tmp = path.with_suffix(".tmp")
+            tmp = unique_tmp(path)
             part.to_parquet(tmp, index=False)
-            os.replace(tmp, path)
+            replace_with_retry(tmp, path)
         return added
 
     def all(self) -> pd.DataFrame:

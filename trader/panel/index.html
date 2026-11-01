@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Trader — Painel</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+    --on: #13795b; --off: #b42318; --accent: #2f5bd3; --mono-bg: #f1f3f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --card: #171b21; --text: #e6e9ee; --muted: #98a2b3; --line: #2a303a;
+            --on: #3ccf91; --off: #f97066; --accent: #7aa2ff; --mono-bg: #11151a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between; }
+  h1 { font-size: 22px; margin: 0; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); }
+  .badge.ok { color: var(--on); } .badge.bad { color: var(--off); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 16px; }
+  .row { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  .title { font-weight: 600; }
+  .state { font-size: 13px; color: var(--muted); }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: var(--off); }
+  .dot.on { background: var(--on); }
+  button { font: inherit; padding: 8px 18px; border-radius: 8px; border: 0; cursor: pointer; color: #fff; min-width: 110px; }
+  button.start { background: var(--on); } button.stop { background: var(--off); }
+  button:disabled { opacity: .5; cursor: default; }
+  pre { background: var(--mono-bg); border-radius: 8px; padding: 10px; margin: 12px 0 0; font-size: 12px;
+        overflow-x: auto; white-space: pre; max-height: 220px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 12px; }
+  .stat { border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+  .stat .v { font-size: 20px; font-weight: 600; } .stat .k { font-size: 12px; color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 14px; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  footer { margin-top: 20px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>AI Trader — Painel <a href="http://127.0.0.1:8766" target="_blank" style="font-size:14px;font-weight:400;margin-left:10px">conversar com a LLM →</a></h1>
+    <div class="badges">
+      <span class="badge ok" id="paper">Somente papel: nenhuma ordem real</span>
+      <span class="badge" id="ollama">LLM local: …</span>
+      <span class="badge" id="ram">RAM livre: …</span>
+    </div>
+  </header>
+  <div id="jobs"></div>
+  <section class="card">
+    <div class="title">Comparação ao vivo: day trade 5m (gerações de 3h) e scalper 1m (gerações de 1h), carteira SOL + ETH + XRP, mesmo ponto de partida por estilo</div>
+    <div style="overflow-x:auto"><table id="compare"></table></div>
+    <div class="state" style="margin-top:8px">Nota = retorno / maior queda (retorno ajustado ao risco). Referência = média móvel 20/50 nas mesmas janelas.</div>
+  </section>
+  <section class="card">
+    <div class="title">Tendência diária — candidata mais sólida (papel, R$1.000)</div>
+    <div class="stats" id="trend"><div class="state">Começa a contar no próximo fechamento diário.</div></div>
+  </section>
+  <section class="card">
+    <div class="title">Tendência diária + filtro (meta-labeling) — mesmo comitê, posição reduzida quando o sinal parece fraco</div>
+    <div class="stats" id="trend_filter"><div class="state">Começa a contar no próximo fechamento diário.</div></div>
+    <div class="state" style="margin-top:8px">No teste fora da amostra (2024–2026) o filtro rendeu um pouco menos e caiu quase metade. Aqui é a prova ao vivo, lado a lado.</div>
+  </section>
+  <section class="card">
+    <div class="title">Tendência diária: 5 criptos + ouro (PAXG) — outra classe de ativo na mesma carteira</div>
+    <div class="stats" id="trend_gold"><div class="state">Começa a contar no próximo fechamento diário.</div></div>
+    <div class="state" style="margin-top:8px">Fora da amostra (2024–2026): queda máxima de 19,5% para 13,9% com retorno igual ou maior. Ouro tem correlação ~0,14 com o BTC.</div>
+  </section>
+  <section class="card">
+    <div class="title">Ranking dos melhores agentes vivos (todos os forks)</div>
+    <div style="overflow-x:auto"><table id="ranking"></table></div>
+    <div class="state" style="margin-top:8px">Ordenado pela nota da vida inteira (retorno ÷ maior queda). Acerto = % de operações com lucro. Idade = janelas vividas.</div>
+  </section>
+  <footer>Atualiza a cada 5 s. Só acessível neste computador (127.0.0.1).</footer>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
+
+function stat(k, v) { return `<div class="stat"><div class="v">${esc(v)}</div><div class="k">${esc(k)}</div></div>`; }
+
+function render(s) {
+  const o = $("ollama");
+  o.textContent = s.ollama ? "LLM local: no ar" : "LLM local: fora do ar (Criador usa regras)";
+  o.className = "badge " + (s.ollama ? "ok" : "bad");
+  const ram = $("ram");
+  ram.textContent = "Sistema: " + s.system_gb + " de " + s.budget_gb + " GB · RAM livre no PC: " + s.ram_free_gb + " GB";
+  ram.className = "badge " + (s.ram_free_gb >= 1.5 && s.system_gb <= s.budget_gb ? "ok" : "bad");
+  $("jobs").innerHTML = Object.entries(s.jobs).map(([key, j]) => `
+    <section class="card">
+      <div class="row">
+        <div>
+          <div class="title">${esc(j.title)}</div>
+          <div class="state"><span class="dot ${j.running ? "on" : ""}"></span>${j.running ? "Ligado" : (j.paused ? (j.paused_reason ? "Pausado: " + esc(j.paused_reason) + " (precisa de correção)" : "Pausado pela memória (volta sozinho)") : "Desligado")}</div>
+        </div>
+        <button class="${j.running ? "stop" : "start"}" data-key="${key}" data-action="${j.running ? "stop" : "start"}">
+          ${j.running ? "Desligar" : "Ligar"}</button>
+      </div>
+      <pre>${esc(j.log.join("\n") || "(sem registros)")}</pre>
+    </section>`).join("");
+  const pct = (x) => (x * 100).toFixed(2) + "%";
+  const rows = [
+    ["Hoje: melhor agente", (l) => pct(l.today_best)], ["Hoje: retorno mediano", (l) => pct(l.today_median)],
+    ["Hoje: operações", (l) => l.today_trades],
+    ["Hoje: acerto (% de operações com lucro)", (l) => l.today_hit === null ? "—" : (l.today_hit * 100).toFixed(0) + "%"],
+    ["Gerações", (l) => l.generations], ["Agentes vivos", (l) => l.alive], ["Já nasceram", (l) => l.born],
+    ["Melhor retorno", (l) => pct(l.best_ret)], ["Melhor nota", (l) => l.best_score.toFixed(2)],
+    ["Retorno mediano", (l) => pct(l.median_ret)], ["Operações (vivos)", (l) => l.trades],
+    ["Referência", (l) => pct(l.baseline_ret)], ["Sucessores pela LLM", (l) => l.llm_successors],
+    ["Mortes", (l) => Object.entries(l.deaths).map(([c, n]) => c + " " + n).join(", ") || "—"],
+  ];
+  const pops = Object.values(s.live);
+  $("compare").innerHTML = "<tr><th></th>" + pops.map((p) => `<th>${esc(p.title)}</th>`).join("") + "</tr>"
+    + rows.map(([name, f]) => `<tr><td>${esc(name)}</td>` + pops.map((p) =>
+        `<td>${p.born === undefined ? "—" : esc(f(p))}</td>`).join("") + "</tr>").join("");
+}
+
+function renderTrend(t, id = "trend") {
+  if (!t || !t.date) return;
+  const brl = (x) => "R$ " + x.toLocaleString("pt-BR", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  const pct = (x) => (x * 100).toFixed(2) + "%";
+  const w = Object.entries(t.weights).map(([k, v]) => k.split("/")[0] + " " + (v * 100).toFixed(0) + "%").join(" · ");
+  $(id).innerHTML = stat("patrimônio", brl(t.equity)) + stat("retorno desde " + t.start, pct(t.ret))
+    + stat("maior queda", pct(t.max_dd)) + stat("dias", t.days) + stat("posição de hoje", w || "caixa");
+}
+
+function renderRanking(rows) {
+  const pct = (x) => (x * 100).toFixed(2) + "%";
+  const head = "<tr><th>#</th><th>Fork</th><th>Agente</th><th>Estilo / estratégia</th><th>Nota</th><th>Retorno</th>"
+    + "<th>Maior queda</th><th>Operações</th><th>Acerto</th><th>Idade</th><th>Origem</th></tr>";
+  $("ranking").innerHTML = rows && rows.length ? head + rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.fork)}</td>`
+    + `<td>${esc(r.id)}</td><td>${esc(r.style)} / ${esc(r.strategy)}</td><td>${r.score.toFixed(2)}</td>`
+    + `<td>${pct(r.ret)}</td><td>${pct(r.dd)}</td><td>${r.trades}</td>`
+    + `<td>${r.hit === null ? "—" : (r.hit * 100).toFixed(0) + "%"}</td><td>${r.age}</td>`
+    + `<td>${esc(r.origin)} (g${r.generation})</td></tr>`).join("")
+    : '<tr><td class="state">Sem agentes avaliados ainda.</td></tr>';
+}
+
+async function refresh() {
+  try { const s = await (await fetch("/api/status")).json(); render(s); renderRanking(s.ranking); renderTrend(s.trend); renderTrend(s.trend_filter, "trend_filter"); renderTrend(s.trend_gold, "trend_gold"); } catch (e) { $("jobs").innerHTML = '<section class="card">Painel sem resposta.</section>'; }
+}
+
+document.addEventListener("click", async (ev) => {
+  const b = ev.target.closest("button[data-key]");
+  if (!b) return;
+  b.disabled = true; b.textContent = "…";
+  await fetch(`/api/${b.dataset.key}/${b.dataset.action}`, {method: "POST"});
+  setTimeout(refresh, 1500);
+});
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

@@ -31,6 +31,7 @@ import pandas as pd
 
 from trader.blacknews.schema import utc64
 from trader.blacknews.sources import PoliteClient, strip_html
+from trader.storage.atomic import replace_with_retry, unique_tmp
 
 SNIPPET_MAX = 300
 LATENCY = pd.Timedelta(minutes=5)
@@ -249,9 +250,9 @@ class SecurityStore:
             # mantém a primeira coleta (é ela que define a visibilidade ao vivo) e a extração já feita
             items = pd.concat([old, items])
         items = items.sort_values("first_seen_at").drop_duplicates("id", keep="first").reset_index(drop=True)
-        tmp = self.path.with_suffix(".tmp")
+        tmp = unique_tmp(self.path)
         items.to_parquet(tmp, index=False)
-        os.replace(tmp, self.path)
+        replace_with_retry(tmp, self.path)
         return len(items) - before
 
     def replace(self, items: pd.DataFrame) -> None:

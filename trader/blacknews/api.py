@@ -100,4 +100,19 @@ def black_features(
     return pd.concat([base, extra[[c for c in extra if c not in base]]], axis=1)
 
 
-__all__ = ["black_features", "black_features_from", "columns", "analyze_frames"]
+__all__ = ["black_features", "black_features_from", "columns", "analyze_frames", "alt_features"]
+
+
+# dados alternativos
+
+
+def alt_features(symbol: str, timeframe: str, index: pd.DatetimeIndex, families: tuple[str, ...] | None = None,
+                 data: Path | str = DATA) -> pd.DataFrame:
+    """Features black_alt_<família>_* causais no `index` dado. families=None → todas (fng, wiki, deriv, dev, cvm).
+    Colunas de famílias que não se aplicam ao ativo não aparecem (ex.: cvm para BTC)."""
+    from trader.blacknews import alt
+
+    fams = families or alt.FAMILIES
+    store = alt.AltStore(Path(data) / "news_black")
+    stores = {f: store.read(f) for f in fams}
+    return alt.alt_features_from(stores, SYMBOL_ASSET.get(symbol, symbol), index, fams)

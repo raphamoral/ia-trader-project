@@ -5,12 +5,12 @@ Escritas são idempotentes: regravar o mesmo período não duplica linhas.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pandas as pd
 
 from trader.domain import CANDLE_COLUMNS
+from trader.storage.atomic import replace_with_retry, unique_tmp
 
 
 class CandleStore:
@@ -33,9 +33,9 @@ class CandleStore:
             if path.exists():
                 part = pd.concat([pd.read_parquet(path), part])
             part = part.drop_duplicates("ts", keep="last").sort_values("ts").reset_index(drop=True)
-            tmp = path.with_suffix(".tmp")
+            tmp = unique_tmp(path)
             part.to_parquet(tmp, index=False)
-            os.replace(tmp, path)
+            replace_with_retry(tmp, path)
 
     def read(
         self,

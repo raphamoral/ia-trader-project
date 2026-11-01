@@ -27,7 +27,7 @@ import pandas as pd
 from trader.daytrade.broker import FuturesPaperBroker, InsufficientMargin, Trade
 from trader.daytrade.features import news_view
 from trader.daytrade.gate import Close, DaySignal, DayTradeLimits, DayTradeRiskGate, Open
-from trader.daytrade.genome import STAND_ASIDE, DayGenome, signals
+from trader.daytrade.genome import STAND_ASIDE, DayGenome, _atr, signals
 from trader.daytrade.market import NO_MINIMUM, SymbolSpec
 from trader.daytrade.regime import REGIMES, regime_features
 from trader.daytrade.sessions import session_keys
@@ -131,6 +131,36 @@ def funding_lookup(funding: pd.DataFrame | None) -> dict[pd.Timestamp, float] | 
     return dict(zip(funding["ts"], funding["rate"]))
 
 
+RUNNER_ATR_PERIOD = 14
+RUNNER_PCT_WINDOW = 288  # candles para o percentil da volatilidade (1 dia em 5m)
+
+
+def exit_stop(genome: DayGenome, side: int, entry: float, stop0: float, best: float, close: float,
+              atr: float, atr_pct: float, fee: float, runner: bool) -> tuple[float | None, bool]:
+    """Novo stop pelas regras de saída (None = sem mudança) e se o modo "deixa correr" está ligado.
+
+    `best` = preço mais favorável desde a entrada; `stop0` = distância inicial do stop (fração).
+    Quem chama garante que o stop nunca recua.
+    """
+    cands = []
+    gain = side * (best - entry)
+    if genome.trail:
+        cands.append(close * (1 - side * genome.trail))
+    if genome.lock_at is not None and gain >= genome.lock_at * stop0 * entry:
+        floor = entry * (1 + side * 2 * fee)  # zero a zero pagando entrada e saída
+        locked = entry + side * genome.lock_keep * gain
+        cands.append(max(locked, floor) if side > 0 else min(locked, floor))
+    if (not runner and genome.runner_vol is not None and side * (close - entry) > 0
+            and atr_pct == atr_pct and atr_pct >= genome.runner_vol):
+        runner = True
+    if runner and atr == atr:
+        # o ATR atrasa no começo da explosão: nunca mais apertado que o stop inicial
+        cands.append(close - side * max(genome.runner_atr * atr, stop0 * entry))
+    if not cands:
+        return None, runner
+    return (max(cands) if side > 0 else min(cands)), runner
+
+
 def _shift(a: np.ndarray, n: int, fill) -> np.ndarray:
     if not n:
         return a
@@ -190,6 +220,8 @@ def run_daytrade_backtest(
     labels = _shift(reg["regime"].to_numpy(dtype=object), delay, "normal")
     news = news_view(df, genome.black_weight)
     news = {k: _shift(np.asarray(v), delay, 0 if k != "to_event" else 1e4) for k, v in news.items()}
+    crowd = (_shift(df["mkt_funding_bps"].to_numpy(dtype=float), delay, np.nan)
+             if genome.crowd_block is not None and "mkt_funding_bps" in df.columns else None)
     if events is not None:
         ev_by = {genome.strategy: _shift(np.asarray(events, dtype=float), delay, np.nan)}
     else:
@@ -205,6 +237,16 @@ def run_daytrade_backtest(
         vol = df["volume"].where(df["volume"] > 0, 1e-9)
         k = pd.Series(keys)
         vwap = ((typical * vol).groupby(k).cumsum() / vol.groupby(k).cumsum()).to_numpy()
+    exits_on = genome.trail or genome.lock_at is not None or genome.runner_vol is not None
+    if genome.runner_vol is not None:
+        atr_s = _atr(df["high"], df["low"], df["close"], RUNNER_ATR_PERIOD)
+        atr_v = _shift(atr_s.to_numpy(dtype=float), delay, np.nan)
+        atr_p = _shift(atr_s.rolling(RUNNER_PCT_WINDOW, min_periods=50).rank(pct=True).to_numpy(dtype=float),
+                       delay, np.nan)
+    else:
+        atr_v = atr_p = np.full(len(df), np.nan)
+    best_px = stop0 = 0.0
+    runner = False
     own_stop = min(genome.daily_stop, limits.daily_loss_limit * 0.9)  # nunca mais frouxo que o gate
     maker_exit = order_type == "limit"
 
@@ -234,7 +276,7 @@ def run_daytrade_backtest(
     day_log: list[dict] = []
     today: dict = {}
     stats = {"limit_placed": 0, "limit_filled": 0, "stop_placed": 0, "stop_filled": 0,
-             "stand_aside": 0, "news_block": 0, "blackout": 0}
+             "stand_aside": 0, "news_block": 0, "blackout": 0, "crowd_block": 0}
     regime_bars = {r: 0 for r in REGIMES}
     regime_pnl = {r: 0.0 for r in REGIMES}
 
@@ -243,6 +285,7 @@ def run_daytrade_backtest(
 
     def fill(p: _Pending, price: float, i: int, t: pd.Timestamp, at_open: bool) -> None:
         nonlocal last_entry, entry_bar, entries_today, open_risk, entry_regime, grid_levels, midbar_entry
+        nonlocal best_px, runner, stop0
         maker = p.kind in ("limit", "add")
         if p.kind == "add":
             broker.add(symbol, p.qty, price, t, maker=True)
@@ -254,6 +297,7 @@ def run_daytrade_backtest(
         if p.price == p.price and grid:  # grid: alvo fixo na VWAP
             tp = p.take_profit
         broker.open(symbol, p.side, p.qty, price, p.leverage, stop, t, tp, maker=maker)
+        best_px, runner, stop0 = price, False, p.stop
         open_risk = p.qty * price * p.stop
         last_entry = entry_bar = i
         entry_regime = p.regime
@@ -346,13 +390,18 @@ def run_daytrade_backtest(
                 pending = None if pending is not None and pending.kind == "add" else pending
         seen_trades = len(broker.trades)
 
-        # 4) fechamento do candle: trailing stop, patrimônio, ruína
+        # 4) fechamento do candle: trailing, trava de lucro, "deixa correr"; patrimônio, ruína
         pos = broker.position(symbol)
-        if pos is not None and genome.trail:
-            if pos.side > 0:
-                pos.stop = max(pos.stop, float(c[i]) * (1 - genome.trail))
-            else:
-                pos.stop = min(pos.stop, float(c[i]) * (1 + genome.trail))
+        if pos is not None and exits_on:
+            # no candle da entrada no meio, a máxima pode ser anterior à entrada: usa só o fechamento
+            hi, lo = (float(c[i]), float(c[i])) if midbar_entry == i else (float(h[i]), float(l[i]))
+            best_px = max(best_px, hi) if pos.side > 0 else min(best_px, lo)
+            new, runner = exit_stop(genome, pos.side, pos.entry, stop0, best_px, float(c[i]),
+                                    float(atr_v[i]), float(atr_p[i]), broker.taker_fee, runner)
+            if runner:
+                pos.take_profit = None
+            if new is not None:
+                pos.stop = max(pos.stop, new) if pos.side > 0 else min(pos.stop, new)
         close_time = t + tf
         equity = broker.equity({symbol: float(c[i])})
         curve_ts.append(close_time)
@@ -411,6 +460,11 @@ def run_daytrade_backtest(
         if entering and direction in (1, -1) and genome.news_gate is not None:
             if news["sentiment"][i] * direction < -genome.news_gate:
                 stats["news_block"] += 1
+                direction = None if pos is None else 0
+        if entering and direction in (1, -1) and crowd is not None and not math.isnan(crowd[i]):
+            # aglomeração: não entra no lado que já está pagando funding alto
+            if crowd[i] * direction >= genome.crowd_block:
+                stats["crowd_block"] += 1
                 direction = None if pos is None else 0
         if entering and direction in (1, -1) and i - last_entry < genome.cooldown:
             direction = None

@@ -30,3 +30,24 @@ def test_read_filters_range(tmp_path, candles):
 
 def test_read_empty(tmp_path):
     assert CandleStore(tmp_path).read("binance", "ETH/USDT", "1h").empty
+
+
+def test_replace_with_retry_waits_for_locked_target(tmp_path, monkeypatch):
+    import os
+
+    from trader.storage import atomic
+
+    calls = []
+    real = os.replace
+
+    def flaky(src, dst):
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError("em uso por outro processo")
+        real(src, dst)
+
+    monkeypatch.setattr(atomic.os, "replace", flaky)
+    monkeypatch.setattr(atomic.time, "sleep", lambda s: None)
+    (tmp_path / "a.tmp").write_text("novo")
+    atomic.replace_with_retry(tmp_path / "a.tmp", tmp_path / "a.parquet")
+    assert (tmp_path / "a.parquet").read_text() == "novo" and len(calls) == 3

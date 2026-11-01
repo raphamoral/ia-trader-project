@@ -54,6 +54,9 @@ def main(argv: list[str] | None = None) -> None:
     evolve.add_argument("--slots", type=int, default=32)
     evolve.add_argument("--seeds", default="0", help="sementes separadas por vírgula, ex.: 0,1,2")
     evolve.add_argument("--workers", type=int, default=8)
+    evolve.add_argument("--oos-monthly", action="store_true",
+                        help="no início de cada mês, testa o campeão (escolhido só com o passado) naquele mês")
+    evolve.add_argument("--fee", type=float, default=0.001, help="taxa por lado (0.001 = spot; 0.0002 = futuros maker)")
     evolve.add_argument("--llm", action="store_true", help="Criador usa LLM (API compatível com OpenAI)")
     evolve.add_argument("--llm-url", default="http://localhost:11434/v1")
     evolve.add_argument("--llm-model", default="qwen2.5:3b")
@@ -123,21 +126,27 @@ def evolve_once(
     creator: Creator = RuleCreator()
     if args.llm:
         creator = LLMCreator(
-            args.symbol, args.timeframe, args.llm_url, args.llm_model, graveyard=lambda: registry.graveyard(10)
+            args.symbol, args.timeframe, args.llm_url, args.llm_model, graveyard=lambda: registry.graveyard(10),
+            hall=lambda: registry.hall(5),
         )
 
     pop = Population(
         candles, args.symbol, args.timeframe, registry, creator,
-        PopulationConfig(initial=args.population, max_slots=args.slots), seed=seed, executor=executor,
+        PopulationConfig(initial=args.population, max_slots=args.slots, fee_rate=args.fee), seed=seed, executor=executor,
     )
+    if hasattr(creator, "lessons"):
+        creator.lessons = lambda: pop.lessons
     registry.set_meta("run", {
         "symbol": args.symbol, "timeframe": args.timeframe, "seed": seed, "window_days": args.window_days,
         "windows": [[str(a), str(b)] for a, b in windows], "creator": "llm" if args.llm else "rules",
-        "llm_model": args.llm_model if args.llm else None,
+        "llm_model": args.llm_model if args.llm else None, "fee": args.fee,
     })
     pop.seed()
     print(f"[semente {seed}] {len(windows)} gerações de {args.window_days}d, {evo_start:%Y-%m-%d} a {holdout_start:%Y-%m-%d}")
+    monthly: list[dict] = []
     for start, end in windows:
+        if args.oos_monthly:
+            monthly_oos(args, candles, pop, start, monthly)
         r = pop.step(start, end)
         if verbose:
             deaths = " ".join(f"{k}={v}" for k, v in sorted(r.deaths.items())) or "-"
@@ -147,13 +156,16 @@ def evolve_once(
                 f" melhor={r.best_id} {r.best_ret:+.1%} nota={r.best_score:.2f} ref={r.baseline_ret:+.1%}"
             )
 
+    if args.oos_monthly:
+        report_monthly(monthly, seed)
+
     end = last_ts + pd.Timedelta(seconds=1)
     window = candles[candles["ts"] >= holdout_start]
     closes = window["close"].to_numpy()
     result = {
         "seed": seed,
         "champion": None,
-        "baseline": evaluate(BASELINE, candles, args.symbol, args.timeframe, holdout_start, end),
+        "baseline": evaluate(BASELINE, candles, args.symbol, args.timeframe, holdout_start, end, fee_rate=args.fee),
         "buy_hold": {
             "ret": closes[-1] / window["open"].iloc[0] - 1,
             "dd": float((1 - closes / np.maximum.accumulate(closes)).max()),
@@ -165,13 +177,50 @@ def evolve_once(
     champ = pop.champion()
     if champ is not None:
         result["champion"] = champ.id
-        result["holdout"] = evaluate(champ.genome, candles, args.symbol, args.timeframe, holdout_start, end)
+        result["holdout"] = evaluate(champ.genome, candles, args.symbol, args.timeframe, holdout_start, end,
+                                     fee_rate=args.fee)
         print(f"[semente {seed}] campeão {champ.id} (linhagem {champ.lineage}): {champ.genome.to_dict()}")
         print(f"    vida: {champ.life.ret:+.1%}, queda {champ.life.worst_dd:.1%}, {champ.life.trades} ops")
         for step in registry.ancestry(champ.id)[:4]:
             print(f"    {step['id']} [{step['origin']}] {step['note'] or ''}")
     print(f"[semente {seed}] registro: {db_path}")
     return result
+
+
+def monthly_oos(args: argparse.Namespace, candles: pd.DataFrame, pop: Population, start: pd.Timestamp,
+                monthly: list[dict]) -> None:
+    """Na virada do mês: congela o campeão escolhido só com o passado e mede o mês seguinte."""
+    month = start.tz_convert(None).to_period("M")  # mês em UTC, sem aviso de fuso
+    if monthly and monthly[-1]["month"] == month:
+        return
+    champ = pop.champion()
+    m_start = month.start_time.tz_localize("UTC")
+    m_end = (month + 1).start_time.tz_localize("UTC")
+    window = candles[(candles["ts"] >= m_start) & (candles["ts"] < m_end)]
+    if champ is None or window.empty:
+        monthly.append({"month": month, "skip": True})
+        return
+    stats = evaluate(champ.genome, candles, args.symbol, args.timeframe, m_start, m_end, fee_rate=args.fee)
+    base = evaluate(BASELINE, candles, args.symbol, args.timeframe, m_start, m_end, fee_rate=args.fee)
+    bh = window["close"].iloc[-1] / window["open"].iloc[0] - 1
+    monthly.append({"month": month, "skip": False, "champ": stats.ret, "dd": stats.max_dd, "trades": stats.trades,
+                    "base": base.ret, "bh": bh, "id": champ.id})
+
+
+def report_monthly(monthly: list[dict], seed: int) -> None:
+    rows = [m for m in monthly if not m["skip"]]
+    if not rows:
+        print(f"[semente {seed}] avaliação mensal: sem campeão elegível")
+        return
+    df = pd.DataFrame(rows)
+    beat_bh = (df["champ"] > df["bh"]).mean()
+    beat_base = (df["champ"] > df["base"]).mean()
+    t = df["champ"].mean() / (df["champ"].std() / np.sqrt(len(df))) if len(df) > 1 and df["champ"].std() > 0 else 0.0
+    print(f"[semente {seed}] AVALIAÇÃO MENSAL FORA DA AMOSTRA ({len(df)} meses)")
+    print(f"    campeão: média {df['champ'].mean():+.2%}/mês, meses positivos {(df['champ'] > 0).mean():.0%},"
+          f" pior mês {df['champ'].min():+.1%}, t = {t:.2f}")
+    print(f"    comprar e segurar: média {df['bh'].mean():+.2%}/mês, pior mês {df['bh'].min():+.1%}")
+    print(f"    campeão bate comprar e segurar em {beat_bh:.0%} dos meses; bate a referência em {beat_base:.0%}")
 
 
 def registry_path(data: Path, run: str) -> Path:

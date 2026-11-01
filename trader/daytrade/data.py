@@ -14,6 +14,7 @@ import pandas as pd
 from trader.domain import parse_timeframe
 from trader.ingest.binance import OhlcvSource, fetch_candles
 from trader.storage.candles import CandleStore
+from trader.storage.atomic import replace_with_retry, unique_tmp
 
 EXCHANGE = "binanceusdm"
 
@@ -79,9 +80,9 @@ def update_funding(root: Path | str, symbol: str, start: pd.Timestamp, exchange:
     both = pd.concat([old, new]) if len(old) else new
     both = both.drop_duplicates("ts", keep="last").sort_values("ts").reset_index(drop=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    tmp = unique_tmp(path)
     both.to_parquet(tmp, index=False)
-    os.replace(tmp, path)
+    replace_with_retry(tmp, path)
     return len(new)
 
 

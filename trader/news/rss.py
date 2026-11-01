@@ -22,9 +22,25 @@ FEEDS = {
 _ATOM = "{http://www.w3.org/2005/Atom}"
 
 
+def _ssl_context():
+    """Certificados do certifi: o repositório do Windows deste Python está desatualizado
+    (dava 'certificate has expired' no InfoMoney). A verificação continua ligada."""
+    import ssl
+
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_SSL = _ssl_context()
+
+
 def _http_get(url: str, timeout: float = 30.0) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (ai-trader-research)"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as resp:
         return resp.read()
 
 

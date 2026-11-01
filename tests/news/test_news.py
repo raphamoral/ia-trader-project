@@ -36,7 +36,7 @@ def raw(title, domain="reuters.com", minutes=0, lang="en", backfilled=True, seen
 
 def test_whitelist_tiers_and_subdomains():
     assert tier_of("www.reuters.com") == 1
-    assert tier_of("markets.businessinsider.com") is None
+    assert tier_of("biztoc.com") is None
     assert tier_of("coindesk.com") == 2
     frame = make_frame([raw("a"), raw("b", domain="random-crypto-blog.xyz")])
     assert frame["domain"].tolist() == ["reuters.com"]
@@ -364,3 +364,36 @@ def test_items_seen_long_after_publication_are_historical(tmp_path):
     legacy.to_parquet(store.root / "2024-01.parquet", index=False)
     assert store.fix_historical_flags() == 1
     assert store.read_all().set_index("original_text")["backfilled"].to_dict() == flags
+
+
+# caminho incremental (cache mensal em disco)
+
+def test_incremental_month_cache_is_causal_and_continues_stories(tmp_path):
+    from trader.news import features
+    from trader.news.pipeline import load_items_range
+
+    end_of_jan = pd.Timestamp("2024-01-31 23:00", tz="UTC")
+    rows = [raw("SEC approves spot bitcoin ETFs", minutes=0, url="https://reuters.com/a"),
+            {**raw("SEC approves spot bitcoin ETFs trading", domain="coindesk.com", url="https://coindesk.com/b"),
+             "published_at": end_of_jan, "first_seen_at": end_of_jan + pd.Timedelta(days=400)},
+            {**raw("SEC approves bitcoin spot ETFs", domain="yna.co.kr", lang="ko", url="https://yna.co.kr/c"),
+             "published_at": end_of_jan + pd.Timedelta(hours=5), "first_seen_at": end_of_jan + pd.Timedelta(days=400)}]
+    # itens 2 e 3 a 5 h de distância, atravessando a virada do mês: mesma história
+    NewsStore(tmp_path).write(make_frame(rows))
+    since, until = pd.Timestamp("2024-01-25", tz="UTC"), pd.Timestamp("2024-02-03", tz="UTC")
+    items = load_items_range(tmp_path, since, until)
+    feb = items[items["published_at"] >= "2024-02-01"]
+    jan_late = items[items["published_at"] == end_of_jan]
+    assert feb["story_id"].iloc[0] == jan_late["story_id"].iloc[0] and feb["story_rank"].iloc[0] == 1
+
+    idx = pd.date_range("2024-01-31 20:00", "2024-02-01 12:00", freq="15min", tz="UTC")
+    before = news_features("BTC/USDT", "15m", idx, data=tmp_path, use_reputation=False)
+    future = {**raw("bitcoin crash hack plunge", url="https://reuters.com/z"),
+              "published_at": pd.Timestamp("2024-02-01 06:00", tz="UTC"),
+              "first_seen_at": pd.Timestamp("2025-01-01", tz="UTC")}
+    NewsStore(tmp_path).write(make_frame([future]))
+    features._prepared.cache_clear()
+    after = news_features("BTC/USDT", "15m", idx, data=tmp_path, use_reputation=False)
+    early = idx < pd.Timestamp("2024-02-01 06:05", tz="UTC")
+    pd.testing.assert_frame_equal(before[early], after[early])
+    assert (tmp_path / "news" / "derived").exists()  # o mês ficou em cache

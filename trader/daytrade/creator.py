@@ -131,6 +131,11 @@ Other genes:
 - direction: "long" | "short" | "both"
 - leverage: 1-10 (capped by the limit above); stop: 0.002-0.05 (distance as fraction of price)
 - take_profit: null or 1-5 (multiples of the stop distance); risk: 0.002-0.1 (fraction of equity lost at the stop)
+- trail: null or 0.002-0.05 (trailing stop from entry, fraction of price)
+- lock_at: null or 0.3-5 (profit lock: once the best gain reaches lock_at x the stop distance, the stop rises to keep
+  lock_keep 0-0.9 of that gain, never below breakeven plus fees; it never moves back)
+- runner_vol: null or 0.5-0.99 (when in profit and ATR percentile >= this, cancel take_profit and let it run with
+  the stop at runner_atr 0.5-6 ATRs from the close, only ever moving up)
 - cooldown: 0-48 candles between entries; max_hold: 0 (off) or up to 96 candles
 - max_trades_per_day: {mt}; daily_stop: {ds} (must be below the frozen daily loss);
   daily_target: null or {dt} (1.0 = +100% in a day; once hit the agent stops until next session)
@@ -144,11 +149,15 @@ Diagnosis in plain words:
 Recent deaths (avoid repeating them):
 {graveyard}
 
+Agents that thrived (hall of fame, with why they won; borrow what fits):
+{hall}
+
 Change as little as possible to fix the diagnosis. Keep the strategy unless the cause is negative_edge or no_goal.
 Answer with JSON only:
 {{"genome": {{"strategy": ..., "params": {{...}}, "direction": ..., "leverage": ..., "stop": ..., "take_profit": ...,
   "risk": ..., "cooldown": ..., "max_trades_per_day": ..., "daily_stop": ..., "daily_target": ..., "max_hold": ...,
-  "after_win_mult": ..., "after_loss_mult": ..., "goal_pressure": ..., "style": ..., "trail": ..., "entry_offset": ...,
+  "after_win_mult": ..., "after_loss_mult": ..., "goal_pressure": ..., "style": ..., "trail": ..., "lock_at": ..., "lock_keep": ...,
+  "runner_vol": ..., "runner_atr": ..., "entry_offset": ...,
   "order_expiry": ..., "slippage": ..., "regime_map": ..., "news_gate": ..., "news_follow": ..., "event_blackout": ...,
   "news_size_mult": ..., "black_weight": ...}},
   "why": "<one sentence>"}}"""
@@ -207,14 +216,19 @@ class DayLLMCreator:
         timeout: float = 300.0,
         graveyard: Callable[[], list[dict[str, Any]]] = list,
         post: Callable[[str, dict[str, Any], float], dict[str, Any]] = _post_json,
+        hall: Callable[[], list[dict[str, Any]]] = list,
         fallback: DayRuleCreator | None = None,
+        lessons: Callable[[], list[str]] | None = None,
+        library: Callable[[str], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.symbol, self.timeframe, self.context = symbol, timeframe, context
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.timeout = model, timeout
-        self.graveyard, self.post = graveyard, post
+        self.graveyard, self.post, self.hall = graveyard, post, hall
         self.fallback = fallback or DayRuleCreator()
         self.failures = 0
+        self.lessons = lessons  # playbook dos livros (ou hipóteses iniciais)
+        self.library = library  # RAG dos livros (busca agêntica)
 
     styles: list[str] = list(STYLES)
     black_allowed: bool = True
@@ -225,7 +239,7 @@ class DayLLMCreator:
             f"- {s}: {STYLE_DESCRIPTIONS[s]}; eligible: {', '.join(eligible(s))}" for s in self.styles
         )
         regimes = "\n".join(f"- {r}: {REGIME_DESCRIPTIONS[r]}" for r in REGIMES)
-        return PROMPT.format(
+        prompt = PROMPT.format(
             styles=styles, regimes=regimes,
             black_rule="must be 0 in this experiment arm" if not self.black_allowed else "evolvable",
             symbol=self.symbol, timeframe=self.timeframe, catalog=catalog,
@@ -235,8 +249,27 @@ class DayLLMCreator:
             autopsy=json.dumps(autopsy, default=str),
             diagnosis=diagnose_day(autopsy),
             graveyard=json.dumps(self.graveyard()[-8:], default=str),
+            hall=json.dumps(self.hall()[:3], default=str),
             **self.context,
         )
+        return self._with_knowledge(prompt, diagnose_day(autopsy))
+
+    def _with_knowledge(self, prompt: str, situation: str) -> str:
+        """Acrescenta o playbook dos livros e trechos do RAG antes do formato da resposta."""
+        extra = ""
+        try:
+            rules = self.lessons() if self.lessons else []
+            if rules:
+                extra += "Playbook from trading books (follow unless the evidence contradicts):\n"
+                extra += "\n".join(f"- {r}" for r in rules[:10]) + "\n\n"
+            passages = self.library(situation)[:3] if self.library else []
+            if passages:
+                extra += "Reference passages (cite as [book p.N] in why if used):\n"
+                extra += "\n".join(f"[{p['book']} p.{p['page']}] {str(p['text'])[:500]}" for p in passages) + "\n\n"
+        except Exception:
+            pass  # livros fora do ar não impedem o Criador
+        cut = prompt.rfind("Answer")
+        return prompt[:cut] + extra + prompt[cut:] if cut >= 0 else prompt + "\n\n" + extra
 
     def successor(self, g: DayGenome, autopsy: dict[str, Any], rng: random.Random) -> tuple[DayGenome, str]:
         try:

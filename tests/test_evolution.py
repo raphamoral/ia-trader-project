@@ -170,3 +170,122 @@ def test_signal_check_verdict_detects_real_difference():
     better = [{**s, "rules": s["rules"] + 1.0} for s in noise]
     assert not verdict(noise).has_signal
     assert verdict(better).has_signal and verdict(better).rules_vs_random > 0.7
+
+
+def test_successors_are_designed_in_parallel_and_deterministic():
+    import threading
+    import time as _time
+
+    class SlowCreator(RuleCreator):
+        def __init__(self):
+            self.threads = set()
+
+        def successor(self, genome, autopsy, rng):
+            self.threads.add(threading.get_ident())
+            _time.sleep(0.05)
+            return super().successor(genome, autopsy, rng)
+
+    def run(threads):
+        df = random_walk(2000, seed=11)
+        creator = SlowCreator()
+        cfg = PopulationConfig(initial=12, max_slots=16, rules=SelectionRules(min_trades=1, max_age=2), creator_threads=threads)
+        pop = Population(df, "X", "4h", Registry(":memory:"), creator, cfg, seed=4)
+        pop.seed()
+        start = df["ts"].iloc[300]
+        for a, b in walk_forward_windows(start, start + pd.Timedelta(days=150), pd.Timedelta(days=30)):
+            pop.step(a, b)
+        return [a.genome for a in pop.alive], creator.threads
+
+    serial, _ = run(1)
+    parallel, used = run(4)
+    assert serial == parallel  # mesma população, com 1 ou 4 threads
+    assert len(used) > 1
+
+
+def test_thrivers_enter_hall_and_children_use_success_report():
+    prompts = []
+
+    def fake_post(url, payload, timeout):
+        prompts.append(payload["messages"][0]["content"])
+        answer = {"genome": {"strategy": "ma_cross", "params": {"fast": 9, "slow": 60}}, "why": "keep trend filter"}
+        return {"choices": [{"message": {"content": json.dumps(answer)}}]}
+
+    df = random_walk(3000, seed=21)
+    reg = Registry(":memory:")
+    creator = LLMCreator("X", "4h", post=fake_post, graveyard=lambda: reg.graveyard(5), hall=lambda: reg.hall(5),
+                         library=lambda q: [{"book": "Livro Teste", "page": 42, "text": "cut losses early"}])
+    cfg = PopulationConfig(initial=10, max_slots=16, rules=SelectionRules(min_trades=1, max_age=6, thrive_streak=1))
+    pop = Population(df, "X", "4h", reg, creator, cfg, seed=3)
+    pop.seed()
+    start = df["ts"].iloc[300]
+    for a, b in walk_forward_windows(start, start + pd.Timedelta(days=300), pd.Timedelta(days=30)):
+        pop.step(a, b)
+    hall = reg.hall(10)
+    assert hall and all("winning_context" in h for h in hall)
+    child_prompts = [p for p in prompts if "THRIVED" in p]
+    assert child_prompts and "Success report" in child_prompts[0]
+    design = [p for p in prompts if "playbook" not in p]  # prompts de sucessor e de filho
+    assert all("[Livro Teste p.42]" in p for p in design)  # trechos do RAG entram nos dois tipos de prompt
+    notes = [r[0] for r in reg.db.execute("SELECT note FROM agents WHERE origin = 'child'")]
+    assert any("LLM (sucesso)" in n for n in notes)
+
+
+def test_basket_evaluation_trades_every_asset():
+    a, b = random_walk(1500, seed=31), random_walk(1500, seed=32)
+    g = [Genome("ma_cross", {"fast": 5, "slow": 20})]
+    single = Population(a, "A", "4h", Registry(":memory:"), RuleCreator())
+    basket = Population({"A": a, "B": b}, "A", "4h", Registry(":memory:"), RuleCreator())
+    start = a["ts"].iloc[300]
+    end = start + pd.Timedelta(days=60)
+    one = single._evaluate_all(g, start, end)[0]
+    both = basket._evaluate_all(g, start, end)[0]
+    only_b = Population(b, "B", "4h", Registry(":memory:"), RuleCreator())._evaluate_all(g, start, end)[0]
+    assert both.trades == one.trades + only_b.trades
+    assert both.ret == pytest.approx((one.ret + only_b.ret) / 2)
+
+
+def test_best_of_n_keeps_the_screened_winner_and_logs_proposals():
+    df = random_walk(2500, seed=41)
+    reg = Registry(":memory:")
+    cfg = PopulationConfig(initial=10, max_slots=14, rules=SelectionRules(min_trades=1, max_age=3), candidates=4)
+    pop = Population(df, "X", "4h", reg, RuleCreator(), cfg, seed=5)
+    pop.seed()
+    start = df["ts"].iloc[300]
+    for a, b in walk_forward_windows(start, start + pd.Timedelta(days=240), pd.Timedelta(days=30)):
+        pop.step(a, b)
+    rows = reg.db.execute("SELECT candidates, chosen FROM proposals").fetchall()
+    assert rows
+    for candidates, chosen in rows:
+        scores = [c["score"] for c in json.loads(candidates)]
+        assert len(scores) == 4 and scores[chosen] == max(scores)
+
+
+def test_lessons_are_distilled_and_injected_into_prompts():
+    prompts = []
+
+    def post(url, payload, timeout):
+        text = payload["messages"][0]["content"]
+        prompts.append(text)
+        if "playbook" in text:
+            body = {"lessons": ["Agents with a trend_filter survived falling markets."]}
+        elif "candidates" in text:
+            g = {"strategy": "ma_cross", "params": {"fast": 8, "slow": 40}}
+            body = {"candidates": [{"genome": g, "why": "a"}, {"genome": {**g, "size": 0.5}, "why": "b"}]}
+        else:
+            body = {"genome": {"strategy": "ma_cross", "params": {"fast": 8, "slow": 40}}, "why": "x"}
+        return {"choices": [{"message": {"content": json.dumps(body)}}]}
+
+    df = random_walk(2500, seed=43)
+    reg = Registry(":memory:")
+    creator = LLMCreator("X", "4h", post=post, graveyard=lambda: reg.graveyard(5), hall=lambda: reg.hall(5))
+    cfg = PopulationConfig(initial=10, max_slots=14, rules=SelectionRules(min_trades=1, max_age=3),
+                           candidates=2, lessons_every=2)
+    pop = Population(df, "X", "4h", reg, creator, cfg, seed=6)
+    creator.lessons = lambda: pop.lessons
+    pop.seed()
+    start = df["ts"].iloc[300]
+    for a, b in walk_forward_windows(start, start + pd.Timedelta(days=240), pd.Timedelta(days=30)):
+        pop.step(a, b)
+    assert pop.lessons == ["Agents with a trend_filter survived falling markets."]
+    assert reg.meta()["lessons"]["lessons"] == pop.lessons
+    assert any("Lessons learned so far" in p and "trend_filter survived" in p for p in prompts)

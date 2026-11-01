@@ -47,10 +47,26 @@ class SourceDisabled(Exception):
 Fetch = Callable[[str, dict[str, str]], tuple[int, bytes, dict[str, str]]]
 
 
+def _ssl_context():
+    """Cadeia de certificados do certifi: o repositório do Windows deste Python está desatualizado
+    (dava 'certificate has expired' em sites válidos). A verificação continua ligada."""
+    import ssl
+
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_SSL = _ssl_context()
+
+
 def _urllib_fetch(url: str, headers: dict[str, str]) -> tuple[int, bytes, dict[str, str]]:
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60, context=_SSL) as resp:
             return resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as exc:
         return exc.code, b"", dict(exc.headers or {})

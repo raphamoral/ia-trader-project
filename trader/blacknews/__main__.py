@@ -72,6 +72,11 @@ def main(argv: list[str] | None = None) -> None:
     se = sub.add_parser("sec-extract", help="monitor de segurança: extração de incidentes (LLM local, cache)")
     se.add_argument("--max-calls", type=int, default=15)
     sl = sub.add_parser("sec-leadlag", help="monitor de segurança: incidentes, profundidade e lead/lag")
+    ab = sub.add_parser("alt-backfill", help="dados alternativos: coleta pelas APIs públicas aprovadas")
+    ab.add_argument("--families", default="fng,wiki,dev,cvm", help="deriv é longo: use --deriv-since")
+    ab.add_argument("--deriv-since", default=None, help="baixa métricas de futuros diárias a partir desta data")
+    ab.add_argument("--cvm-years", default="2018-2026")
+    sub.add_parser("alt-report", help="dados alternativos: profundidade por fonte e fontes recusadas")
     x = sub.add_parser("experiment-demo", help="harness A/B/B'/C com avaliação sintética (stub)")
     x.add_argument("--seeds", type=int, default=10)
     args = p.parse_args(argv)
@@ -226,6 +231,55 @@ def main(argv: list[str] | None = None) -> None:
         print(f"status: {lags['status'].value_counts().to_dict()}")
         if lags["status"].isin(["lead", "echo"]).sum() < 30:
             print("AVISO: menos de 30 incidentes casados com notícia confiável; amostra pequena demais para conclusões.")
+
+    elif args.cmd == "alt-backfill":
+        from trader.blacknews import alt
+
+        client, store = sources.PoliteClient(), alt.AltStore(BLACK_ROOT)
+        fams = set(filter(None, args.families.split(",")))
+        jobs = {"fng": lambda: alt.fetch_fng(client), "wiki": lambda: alt.fetch_wiki(client),
+                "dev": lambda: alt.fetch_dev(client)}
+        a, b = (int(x) for x in args.cvm_years.split("-"))
+        jobs["cvm"] = lambda: alt.fetch_cvm(client, list(range(a, b + 1)))
+        for fam in [f for f in jobs if f in fams]:
+            try:
+                df = jobs[fam]()
+            except alt.AltSourceNotAllowed as exc:
+                print(f"  {fam}: recusada ({exc})")
+                continue
+            except Exception as exc:
+                print(f"  {fam}: erro {type(exc).__name__}: {exc}")
+                continue
+            print(f"  {fam}: {len(df)} linhas ({store.write(fam, df)} novas)")
+        if args.deriv_since:
+            done = store.read("deriv")
+            have = set(done["ts"].dt.floor("D")) if len(done) else set()
+            days = [d for d in pd.date_range(pd.Timestamp(args.deriv_since, tz="UTC"),
+                                             pd.Timestamp.now(tz="UTC").floor("D") - pd.Timedelta(days=1), freq="D")
+                    if d not in have]
+            added = 0
+            for k, day in enumerate(days):
+                added += store.write("deriv", alt.fetch_deriv_day(client, day))
+                if k % 50 == 0:
+                    print(f"  deriv: {k}/{len(days)} dias, +{added} linhas", flush=True)
+            print(f"  deriv: {len(days)} dias baixados, +{added} linhas")
+
+    elif args.cmd == "alt-report":
+        from trader.blacknews import alt
+
+        store = alt.AltStore(BLACK_ROOT)
+        for name, p in alt.POLICIES.items():
+            if not p.allowed:
+                print(f"  {name:15s} RECUSADA: {p.reason}")
+                continue
+            df = store.read("deriv" if name == "deriv_api" else name)
+            if name == "deriv_api":
+                continue
+            if df.empty:
+                print(f"  {name:15s} sem dados ainda (profundidade disponível: {p.depth})")
+                continue
+            print(f"  {name:15s} {len(df):8d} linhas, {df['key'].nunique():4d} chaves, "
+                  f"{df['ts'].min():%Y-%m-%d} → {df['ts'].max():%Y-%m-%d} (disponível: {p.depth})")
 
     elif args.cmd == "experiment-demo":
         print(experiment.run_experiment(experiment.stub_evaluate, experiment.DEMO_COLUMNS, list(range(args.seeds))).text())

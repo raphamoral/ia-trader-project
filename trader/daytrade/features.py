@@ -18,7 +18,7 @@ import pandas as pd
 from trader.domain import parse_timeframe
 
 FeatureProvider = Callable[[str, str, pd.DatetimeIndex], pd.DataFrame]
-PREFIXES = ("news_", "black_")
+PREFIXES = ("news_", "black_", "mkt_")
 
 
 def attach_features(
@@ -120,12 +120,16 @@ def real_white(data: str = "data") -> FeatureProvider:
     return provider
 
 
-def real_black(weighted: bool, data: str = "data") -> FeatureProvider:
+def real_black(weighted: bool, data: str = "data", live: bool = False) -> FeatureProvider:
+    """No histórico calcula na hora; ao vivo só lê o cache horário (calcular por fork estourava a RAM)."""
     from pathlib import Path
 
+    from trader.blacknews import cache
     from trader.blacknews.api import black_features
 
     def provider(symbol: str, timeframe: str, index: pd.DatetimeIndex) -> pd.DataFrame:
+        if live:
+            return cache.read(Path(data), symbol, timeframe, weighted, index)
         return black_features(symbol, timeframe, index, weighted=weighted, data=Path(data))
 
     provider.__name__ = f"black_features_{'rw' if weighted else 'raw'}"

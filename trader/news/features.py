@@ -23,14 +23,19 @@ import pandas as pd
 from trader.domain import parse_timeframe
 from trader.news.calendar import RELEVANT
 from trader.news.reputation import Reputation, cap_shares
-from trader.news.sources import TIER_WEIGHT
+from trader.news.sources import TIER_WEIGHT, UNLISTED_TIER
 
 SYMBOL_ASSET = {"BTC/USDT": "BTC", "BTCUSDT": "BTC", "BOVA11": "IBOV", "PETR4": "PETR4", "VALE3": "VALE3", "USDBRL": "USDBRL"}
 WINDOWS = {"1h": pd.Timedelta(hours=1), "4h": pd.Timedelta(hours=4), "24h": pd.Timedelta(hours=24)}
 
 
-def relevant(items: pd.DataFrame, asset: str) -> pd.DataFrame:
-    """Itens sobre o ativo: pelos rótulos; sem rótulo de ativo, pela busca que os trouxe."""
+def relevant(items: pd.DataFrame, asset: str, include_unlisted: bool = False) -> pd.DataFrame:
+    """Itens sobre o ativo: pelos rótulos; sem rótulo de ativo, pela busca que os trouxe.
+
+    Fontes fora da lista branca (tier=UNLISTED_TIER) ficam de fora, salvo include_unlisted.
+    """
+    if not include_unlisted and len(items):
+        items = items[items["tier"] != UNLISTED_TIER]
     labeled = items["assets"].fillna("").str.split(",")
     queried = items["query_assets"].fillna("").str.split(",")
     mask = np.array([asset in lab if any(lab) else asset in q for lab, q in zip(labeled, queried)], dtype=bool)
@@ -136,30 +141,30 @@ def _asset_of(symbol: str) -> str:
 
 
 @functools.lru_cache(maxsize=16)
-def _prepared(data: str, asset: str, latency_min: float, use_reputation: bool, stamp: tuple) -> dict:
-    """Arrays por item do ativo, ordenados por visibilidade, com somas acumuladas. Cacheado."""
-    from trader.news.enrich import Enricher
-    from trader.news.pipeline import build_reputation, load_calendar, load_items
+def _prepared(data: str, asset: str, latency_min: float, use_reputation: bool, since: pd.Timestamp,
+              until: pd.Timestamp, stamp: tuple) -> dict:
+    """Arrays por item do ativo no período, ordenados por visibilidade, com somas acumuladas. Cacheado."""
+    from trader.news.pipeline import default_weight, load_calendar, load_items_range, reputation_snapshots, week_start
 
     root = Path(data)
-    items = load_items(root, Enricher(root), pd.Timedelta(minutes=latency_min))
+    latency = pd.Timedelta(minutes=latency_min)
+    items = load_items_range(root, since, until, latency)
     news = relevant(items, asset) if len(items) else items
     n = len(news)
     vis = news["visible_at"].dt.tz_convert(None).to_numpy(dtype="datetime64[ns]") if n else np.array([], "datetime64[ns]")
+    rep_w = np.ones(n)
     if n and use_reputation:
-        rep = build_reputation(root, items, pd.Timedelta(hours=4))
-        # peso congelado na semana em que o item ficou visível (resultados resolvidos antes disso)
-        weeks = news["visible_at"].dt.floor("D") - pd.to_timedelta(news["visible_at"].dt.dayofweek, unit="D")
-        rep_w = np.empty(n)
-        for week, idx in news.groupby(weeks).groups.items():
-            rep_w[news.index.get_indexer(idx)] = rep.weights(week, news.loc[idx, "domain"].tolist()).to_numpy()
-    else:
-        rep_w = np.ones(n)
+        # peso congelado na foto do início da semana em que o item ficou visível
+        # (resultados resolvidos antes dela): causal por construção
+        weeks = news["visible_at"].map(week_start)
+        snaps = reputation_snapshots(root, sorted(set(weeks)), latency=latency)
+        table = {(w, d): x for w, d, x in zip(snaps["week"], snaps["domain"], snaps["weight"])}
+        rep_w = np.array([table.get((w, d), default_weight(d)) for w, d in zip(weeks, news["domain"])])
     w = news["confidence"].to_numpy(float) * news["tier"].map(TIER_WEIGHT).fillna(0.3).to_numpy(float) * rep_w if n else np.array([])
     s = news["sentiment"].to_numpy(float) if n else np.array([])
 
     def cum(x):
-        return np.concatenate([[0.0], np.cumsum(x, dtype=np.float64)])
+        return np.concatenate([[0.0], np.cumsum(np.asarray(x, dtype=np.float64))])
 
     calendar = load_calendar(root)
     ev = np.array([], "datetime64[ns]")
@@ -182,12 +187,6 @@ def _prepared(data: str, asset: str, latency_min: float, use_reputation: bool, s
     }
 
 
-def _stamp(data: Path) -> tuple:
-    """Invalida o cache quando os arquivos de notícias mudam."""
-    files = sorted((data / "news").rglob("*.parquet")) + sorted((data / "news" / "cache").glob("*.jsonl"))
-    return tuple((str(f), f.stat().st_mtime_ns) for f in files)
-
-
 def news_features(
     symbol: str,
     timeframe: str,
@@ -207,7 +206,14 @@ def news_features(
     if idx.tz is None:
         raise ValueError("index precisa de fuso (UTC)")
     kind = "daily" if parse_timeframe(timeframe) >= pd.Timedelta(days=1) else "intraday"
-    p = _prepared(str(data.resolve()), _asset_of(symbol), latency.total_seconds() / 60, use_reputation, _stamp(data))
+    from trader.news.pipeline import range_stamp
+
+    longest = max(SERVE_WINDOWS[kind].values())
+    # período limitado ao que o índice precisa, arredondado ao dia para reaproveitar o cache
+    since = (idx.min() - longest).floor("D")
+    until = idx.max().ceil("D")
+    p = _prepared(str(data.resolve()), _asset_of(symbol), latency.total_seconds() / 60, use_reputation,
+                  since, until, range_stamp(data, since, until))
     t = idx.tz_convert(None).to_numpy(dtype="datetime64[ns]")
     vis = p["vis"]
     hi = np.searchsorted(vis, t, side="right")

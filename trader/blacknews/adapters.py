@@ -37,7 +37,11 @@ def load_trusted(
     pipeline, enrich = trusted_module("pipeline"), trusted_module("enrich")
     if pipeline is None or enrich is None:
         return pd.DataFrame(columns=TRUSTED_COLUMNS)
-    df = pipeline.load_items(Path(data), enrich.Enricher(cache_dir=Path(data)))
+    # período limitado: sem isso, carregava o GDELT inteiro (milhões de linhas, 5 GB de RAM)
+    since = (pd.Timestamp(start) - pd.Timedelta(days=3)) if start is not None else \
+        pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=35)
+    until = (pd.Timestamp(end) + pd.Timedelta(days=1)) if end is not None else None
+    df = pipeline.load_items(Path(data), enrich.Enricher(cache_dir=Path(data)), since=since, until=until)
     if df.empty:
         return pd.DataFrame(columns=TRUSTED_COLUMNS)
     # mesma convenção das fontes black: item coletado >30 min depois de publicado é histórico

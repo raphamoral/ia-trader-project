@@ -197,25 +197,32 @@ def direction_outcomes(
 
     prices: ativo -> série de preços de fechamento indexada pelo horário em que o preço é conhecido.
     """
-    rows = []
-    prices = {a: p.set_axis(pd.DatetimeIndex(p.index).as_unit("ns")) for a, p in prices.items()}
-    # preço "atual" = o último conhecido, desde que não mais velho que 2 intervalos da série
-    stale = {a: 2 * p.index.to_series().diff().median() for a, p in prices.items() if len(p) > 1}
-    for _, it in items.iterrows():
-        if abs(it["sentiment"]) < min_abs_sentiment:
+    strong = items[items["sentiment"].abs() >= min_abs_sentiment]
+    if strong.empty:
+        return pd.DataFrame(columns=OUTCOME_COLUMNS)
+    pairs = strong.assign(asset=strong["assets"].fillna("").str.split(",")).explode("asset")
+    frames = []
+    for asset, grp in pairs.groupby("asset"):
+        p = prices.get(asset)
+        if p is None or len(p) < 2:
             continue
-        for asset in [a for a in str(it.get("assets", "")).split(",") if a in stale]:
-            p = prices[asset]
-            t0, t1 = it["visible_at"], it["visible_at"] + horizon
-            i0, i1 = p.index.searchsorted(t0, "right") - 1, p.index.searchsorted(t1, "right") - 1
-            if i0 < 0 or i1 <= i0 or p.index[i1] < t1 - stale[asset]:
-                continue  # sem preço até o fim do horizonte
-            move = p.iloc[i1] / p.iloc[i0] - 1
-            if abs(move) < noise:
-                continue
-            rows.append({"source": it["domain"], "kind": "direction", "success": bool(np.sign(move) == np.sign(it["sentiment"])),
-                         "resolved_at": t1, "item_id": it["id"], "weight": 1.0})
-    return pd.DataFrame(rows, columns=OUTCOME_COLUMNS)
+        idx = pd.DatetimeIndex(p.index).tz_convert(None).to_numpy(dtype="datetime64[ns]")
+        stale = 2 * np.median(np.diff(idx))
+        vals = p.to_numpy(float)
+        t0 = grp["visible_at"].dt.tz_convert(None).to_numpy(dtype="datetime64[ns]")
+        t1 = t0 + np.timedelta64(int(horizon.total_seconds() * 1e9), "ns")
+        i0 = np.searchsorted(idx, t0, "right") - 1
+        i1 = np.searchsorted(idx, t1, "right") - 1
+        ok = (i0 >= 0) & (i1 > i0) & (idx[np.clip(i1, 0, None)] >= t1 - stale)
+        move = np.where(ok, vals[np.clip(i1, 0, None)] / vals[np.clip(i0, 0, None)] - 1, 0.0)
+        ok &= np.abs(move) >= noise
+        g = grp[ok]
+        frames.append(pd.DataFrame({
+            "source": g["domain"].to_numpy(), "kind": "direction",
+            "success": np.sign(move[ok]) == np.sign(g["sentiment"].to_numpy()),
+            "resolved_at": pd.to_datetime(t1[ok], utc=True), "item_id": g["id"].to_numpy(), "weight": 1.0,
+        }))
+    return pd.concat(frames, ignore_index=True)[OUTCOME_COLUMNS] if frames else pd.DataFrame(columns=OUTCOME_COLUMNS)
 
 
 def story_outcomes(
@@ -228,21 +235,25 @@ def story_outcomes(
     - timeliness: em histórias confirmadas, o item chegou antes do primeiro relato de nível 1?
     - itens com retracted=True (se a coluna existir) contam como falha de confirmação com peso extra.
     """
-    rows = []
     first_t1 = items[items["tier"] == 1].groupby("story_id")["visible_at"].min()
-    for _, it in items.iterrows():
-        if it["tier"] == 1:
-            continue
-        t1 = first_t1.get(it["story_id"])
-        confirmed = t1 is not None and t1 - it["visible_at"] <= confirm_window
-        if bool(it.get("retracted", False)):
-            rows.append({"source": it["domain"], "kind": "confirmation", "success": False,
-                         "resolved_at": it["visible_at"] + confirm_window, "item_id": it["id"], "weight": retraction_weight})
-            continue
-        resolved = max(t1, it["visible_at"]) if confirmed else it["visible_at"] + confirm_window
-        rows.append({"source": it["domain"], "kind": "confirmation", "success": confirmed,
-                     "resolved_at": resolved, "item_id": it["id"], "weight": 1.0})
-        if confirmed:
-            rows.append({"source": it["domain"], "kind": "timeliness", "success": bool(it["visible_at"] < t1),
-                         "resolved_at": resolved, "item_id": it["id"], "weight": 1.0})
-    return pd.DataFrame(rows, columns=OUTCOME_COLUMNS)
+    it = items[(items["tier"] != 1) & (items["tier"] != 9)]
+    if it.empty:
+        return pd.DataFrame(columns=OUTCOME_COLUMNS)
+    t1 = pd.Series(first_t1.reindex(it["story_id"].to_numpy()).to_numpy(), index=it.index)
+    t1 = pd.to_datetime(t1, utc=True)
+    vis = it["visible_at"]
+    confirmed = t1.notna() & (t1 - vis <= confirm_window)
+    retracted = it["retracted"].fillna(False).astype(bool) if "retracted" in it.columns else pd.Series(False, index=it.index)
+    t1_safe = t1.where(confirmed, vis)
+    resolved = t1_safe.where(t1_safe > vis, vis).where(confirmed, vis + confirm_window)
+    conf = pd.DataFrame({
+        "source": it["domain"], "kind": "confirmation", "success": confirmed & ~retracted,
+        "resolved_at": resolved.where(~retracted, vis + confirm_window), "item_id": it["id"],
+        "weight": np.where(retracted, retraction_weight, 1.0),
+    })
+    keep = confirmed & ~retracted
+    timely = pd.DataFrame({
+        "source": it["domain"][keep], "kind": "timeliness", "success": (vis < t1)[keep],
+        "resolved_at": resolved[keep], "item_id": it["id"][keep], "weight": 1.0,
+    })
+    return pd.concat([conf, timely], ignore_index=True)[OUTCOME_COLUMNS]

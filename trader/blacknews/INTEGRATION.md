@@ -29,7 +29,7 @@ Específico daqui: `original_lang` por heurística (as fontes black não informa
 | Medium (RSS por tag) | blog | ativa | feed público; emissor = autor | só os ~10 posts mais recentes por tag |
 | Substack (RSS por publicação) | blog | suportado (`RSSFeed`), nenhuma publicação configurada | — | ~20 posts |
 | coingape, zycrypto, cryptopolitan, u.today, criptonoticias (es) | farm | ativas | RSS público | 1–6 dias (10–94 itens) |
-| bitcoinist, newsbtc, livecoins (pt) | farm | **erro TLS: certificado expirado** (não desliguei a verificação) | — | — |
+| bitcoinist, newsbtc, livecoins (pt) | farm | ativas (o erro "certificado expirado" era o repositório de certificados desatualizado do Python do Windows; `sources.py` usa o `certifi` e a verificação continua ligada) | RSS público | 1–2 dias |
 | Reddit (API oficial) | social | conector pronto, **desligado** | exige app OAuth aprovado manualmente (desde 2025), não comercial, 100 req/min, termos proíbem treinar IA | só `new` (~100 posts por sub) |
 | Bitcointalk | social | **fora** | feed `.xml` desativado pelo admin | — |
 | StockTwits | social | **fora** | sem API pública; Cloudflare | — |
@@ -206,3 +206,47 @@ CLI: `python -m trader.blacknews sec-backfill`, `sec-extract --max-calls N`, `se
   Bitget era artefato dessa falta de cobertura.
 - As features contam só hack, exploit, alegação de vazamento, rug pull e parada de saque. Paradas rotineiras das
   páginas de status ("depósitos atrasados") ficam guardadas, mas não entram.
+
+
+## Dados alternativos (`alt.py`) — `black_alt_<família>_*`
+
+Só APIs e bases públicas oficiais, pelo portão `alt.gate` (fonte recusada ou host diferente = nenhuma requisição).
+User-Agent com contato, intervalos respeitados (GitHub 65 s, CVM 10 s pelo Crawl-Delay).
+
+| Família | Fonte | Situação | Profundidade | Visível em |
+|---|---|---|---|---|
+| fng | alternative.me Fear & Greed | ok (uso livre com atribuição, 60 req/min) | **fev/2018 → hoje**, diário | dia D → D+1 00:00 (hora exata desconhecida) |
+| wiki | Wikimedia pageviews (Bitcoin, Cryptocurrency, Binance, Coinbase; pt: Petrobras, Vale, Ibovespa) | ok | **jul/2015 → hoje**, diário | dia D → D+1 06:00 |
+| deriv | data.binance.vision (OI, long/short de top traders e geral, taker buy/sell), 5 min | ok | **dez/2021 → hoje** (baixado desde jan/2025; `--deriv-since` estende) | create_time + 5 min |
+| deriv_api | fapi.binance.com `futures/data/*` | ok | **só ~30 dias** (por isso a base diária acima) | — |
+| dev | GitHub releases (bitcoin, go-ethereum, agave, rippled) | ok, 60 req/h sem autenticação | anos | published_at + 5 min |
+| cvm | CVM Dados Abertos, VLMO (negociação de administradores, art. 11 Res. 44 / Instr. 358) | ok | **2018 → hoje**, mensal | **Data_Entrega (protocolo) + 1 dia**; reapresentação só vale após o próprio protocolo |
+| — | Whale Alert | **recusada** | sem API gratuita | — |
+| — | fluxo de entrada/saída das exchanges | **recusada** | nenhuma fonte pública gratuita oficial | — |
+| — | Polymarket / Kalshi | **recusadas** | inacessíveis desta rede; não contornamos (regulador declarou mercados de previsão não autorizados no Brasil em mar/2026) | — |
+| — | CoinGecko trending / YouTube | **recusadas** | exigem chave ligada a conta | — |
+| — | B3 aluguel de ações | **pendente** | só pelo Boletim Diário via endpoint interno não documentado; API oficial exige cadastro. Baixar manualmente, como o COTAHIST, e escrever o leitor | desde 25/09/2023 |
+
+Features:
+
+- **fng** (cripto): `black_alt_fng_value`, `black_alt_fng_chg_7d`.
+- **wiki**:
+  - `black_alt_wiki_views_z`: log das visitas contra os 28 dias anteriores;
+  - `black_alt_wiki_views_chg_1d`.
+- **deriv** (cripto): `black_alt_deriv_oi_chg_1h`, `black_alt_deriv_oi_chg_24h`, `black_alt_deriv_top_ls`,
+  `black_alt_deriv_ls`, `black_alt_deriv_taker`, `black_alt_deriv_taker_z`.
+- **dev** (cripto): `black_alt_dev_releases_7d`, `black_alt_dev_days_since_release`.
+- **cvm** (B3): `black_alt_cvm_net_volume_30d` (R$ líquido dos administradores em formulários protocolados nos
+  últimos 30 dias) e `black_alt_cvm_filings_30d`.
+
+```python
+from trader.blacknews.api import alt_features
+from trader.blacknews.alt import alt_arms, alt_pairs, alt_reputation
+fa = alt_features("BTC/USDT", "15m", decision_index)                 # todas as famílias aplicáveis ao ativo
+arms = alt_arms(list(white.columns), list(fa.columns))               # W, W+fng, W+wiki, W+deriv, W+dev, W+alt
+report = run_experiment(evaluate, [], seeds, arms=arms, pairs=alt_pairs(arms), leak_control="W")
+rep = alt_reputation(fa, close_prices)                               # nota por família (direção), point-in-time
+```
+
+Liquidações da Binance (`forceOrders`) agora exigem chave: ficaram de fora. A base diária de métricas só existe
+para os pares USDT-M.
