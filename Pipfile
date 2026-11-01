@@ -13,11 +13,13 @@ numpy = "*"
 scikit-learn = "*"
 websockets = "*"
 trafilatura = "*"
+lxml-html-clean = "*"
 pymupdf = "*"
 anthropic = "*"
 
 [dev-packages]
 pytest = "*"
+pytest-cov = "*"
 
 [requires]
 python_version = "3.12"

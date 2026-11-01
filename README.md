@@ -58,3 +58,5 @@ python -m pytest
 ```
 
 The suite has 300 tests, needs no `data/` folder or `.env`, and takes about two minutes.
+Coverage is 65% of `trader/`. Command-line entry points and one-off research scripts account for most of the gap.
+CI runs the suite on every pull request.
