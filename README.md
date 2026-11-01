@@ -31,7 +31,7 @@ Status: research project, single author, paper trading only. No real money has b
 
 ## Setup
 
-Requires Windows or Linux with Python 3.12. The live scripts in `scripts/` are Windows-only.
+Developed and tested on Windows with Python 3.12. Linux is untested. The live scripts in `scripts/` are Windows-only.
 The optional LLM features use a local [Ollama](https://ollama.com) server.
 
 ```
