@@ -19,6 +19,7 @@ Status: research project, single author, paper trading only. No real money has b
 | `trader/realtime`, `trader/policy` | Millisecond reflexes that act only within an LLM-written JSON policy |
 | `trader/live`, `trader/panel`, `trader/chat` | Paper runners, local web panel and chat |
 | `trader/research` | One script per experiment, including the rejected ones |
+| `trader/lob` | From-scratch price-time matching engine, write-ahead journal with crash recovery, L2 book reconstruction, queue-position model and execution simulator |
 | `trader/b3` | WIN/WDO mini-contract specs, rollover, continuous series, costs |
 | `docs/HISTORICO.md` | Decision log in Portuguese: every experiment with its holdout numbers |
 
@@ -51,12 +52,19 @@ python -m trader.panel
 
 The panel serves http://127.0.0.1:8765.
 
+To record the public Binance futures book and compare limit against market execution:
+
+```
+python -m trader.lob record SOLUSDT --seconds 3600
+python -m trader.lob study data/lob/<file>.jsonl.gz --usd 1000
+```
+
 ## Tests
 
 ```
 python -m pytest
 ```
 
-The suite has 300 tests, needs no `data/` folder or `.env`, and takes about two minutes.
-Coverage is 65% of `trader/`. Command-line entry points and one-off research scripts account for most of the gap.
+The suite has 362 tests, needs no `data/` folder or `.env`, and takes about two minutes.
+Coverage was 65% of `trader/` before `trader/lob` was added. Command-line entry points and one-off research scripts account for most of the gap.
 CI runs the suite on every pull request.

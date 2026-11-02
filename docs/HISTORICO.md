@@ -255,6 +255,12 @@ Hoje o objetivo é lucro próprio. Se um dia virar produto (venda de sinais ou c
 
 59. **Preparação para vender licença do código no DataVendor (datavendor.ai)** (2026-11-01). Marketplace da HUD: licença não exclusiva para laboratórios de IA, só repositório privado, taxa de 20% na retirada. Feito: `README.md`, `.env.example`, `Pipfile` com as 6 dependências que faltavam, e-mail e caminho pessoal movidos para o `.env`. Pendente do usuário, por ordem: decidir se vende, commitar o trabalho e rodar o estimador gratuito. Rascunho do anúncio em `data/datavendor/anuncio.md`. Estimativa da plataforma: US$ 13.949 a US$ 17.173. Adicionados CI (`.github/workflows/ci.yml`) e cobertura medida; a instalação do zero revelou `lxml-html-clean` faltando no `Pipfile`.
 
+60. **Motor de livro de ofertas e simulador de execução** (2026-11-01, `trader/lob/`, `python -m trader.lob`). Construído a pedido do usuário para a revisão de complexidade do DataVendor, com uso próprio: medir ordem limitada na fila contra ordem a mercado.
+    - Peças: casamento preço-tempo do zero (GTC, IOC, FOK, post-only, autoprevenção), diário write-ahead com CRC e recuperação, reconstrução do L2 da Binance com detecção de buracos, modelo de fila e simulador com latência. 385 mil comandos por segundo em Python.
+    - Testes: 62 novos, incluindo comparação com um modelo ingênuo em fluxo aleatório. Os dados reais acharam um defeito que os sintéticos não pegaram (snapshot chegando antes do evento-ponte).
+    - Estudo (20 min em 01/11/2026, ordem de US$1.000, 60 decisões por moeda, espera de 10 s, latência de 100 ms, maker 2 e taker 5 pontos-base): SOL passivo 4,1 × agressivo 5,5 pontos-base (t −3,3, 55% executadas); ETH 3,5 × 5,0 (t −5,2, 67% executadas). Depois de executar como maker, o preço anda ~1 ponto-base contra em 5 s.
+    - Ressalva: 20 minutos de uma única noite não provam nada, e o modelo de fila favorece a ordem passiva (é teto). Não é vantagem direcional e não muda o item 40; só indica que vale gravar dias de dados antes de concluir sobre o custo de execução.
+
 ## Estado atual (2026-10-01)
 
 **Ligados (2026-10-07):** `tendencia`, `tendencia_filtro` e `tendencia_ouro` em papel, o painel (8765), o chat (8766) e o Ollama. Day trade, scalper, coleta e GDELT continuam desligados.
